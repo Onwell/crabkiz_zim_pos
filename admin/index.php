@@ -288,16 +288,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $uploaderIdOrNull = $uploaderId > 0 ? $uploaderId : null;
 
         $pdo->beginTransaction();
-        $sel = $pdo->prepare('SELECT name, size FROM stock_items WHERE sku = ? LIMIT 1');
+        
+        // Check if this exact variant (sku + color + size) exists
+        $sel = $pdo->prepare('SELECT name FROM stock_items WHERE sku = ? AND color = ? AND size = ? LIMIT 1');
         $ins = $pdo->prepare(
             'INSERT INTO stock_items (sku, name, gender, color, size, qty, cost, price, uploaded_by, uploaded_by_name)
              VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
              ON DUPLICATE KEY UPDATE
                qty = qty + 1,
+               name = VALUES(name),
+               gender = VALUES(gender),
                cost = VALUES(cost),
                price = VALUES(price),
-               gender = VALUES(gender),
-               color = VALUES(color),
                uploaded_by = VALUES(uploaded_by),
                uploaded_by_name = VALUES(uploaded_by_name)'
         );
@@ -316,13 +318,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $saved = [];
         foreach ($clean as $r) {
-            $sel->execute([$r['sku']]);
+            $sel->execute([$r['sku'], $r['color'], $r['size']]);
             $ex = $sel->fetch();
-            if ($ex && (mb_strtolower((string)$ex['name']) !== mb_strtolower($r['name'])
-                     || mb_strtolower((string)$ex['size']) !== mb_strtolower($r['size']))) {
-                $skipped++; // same item no. but different details
+            
+            if ($ex && mb_strtolower((string)$ex['name']) !== mb_strtolower($r['name'])) {
+                // Exact variant exists but with a completely different name - reject to prevent typos
+                $skipped++;
                 continue;
             }
+
             $ins->execute([
                 $r['sku'], $r['name'], $r['gender'], $r['color'], $r['size'],
                 $r['cost'], $r['price'], $uploaderIdOrNull, $uploaderName,
@@ -342,14 +346,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         if (!$saved) {
             $pdo->rollBack();
-            echo json_encode(['ok' => false, 'message' => 'Nothing was saved. Item no. already exists with different details.']);
+            echo json_encode(['ok' => false, 'message' => 'Nothing was saved. Item no. already exists with a different name.']);
             exit;
         }
 
         // Notify cashiers: one notification per upload
         $lines = [];
         foreach (array_slice($saved, 0, 10) as $r) {
-            $lines[] = '1 × ' . $r['name'] . ', size ' . $r['size'] . ' (item ' . $r['sku'] . ')';
+            $lines[] = '1 × ' . $r['name'] . ' (' . $r['color'] . ', size ' . $r['size'] . ') [item ' . $r['sku'] . ']';
         }
         if (count($saved) > 10) {
             $lines[] = '…and ' . (count($saved) - 10) . ' more';
@@ -533,6 +537,99 @@ tr:last-child td{border-bottom:0}
 @media(max-width:980px){.kpis{grid-template-columns:repeat(2,1fr)}.grid,.rc{grid-template-columns:1fr}.paper{position:static}.month-compare{flex-direction:column}}
 @media(max-width:760px){.app{grid-template-columns:1fr}.side{position:sticky;height:auto;flex-direction:row;align-items:center;padding:10px 14px;gap:10px;z-index:5;overflow-x:auto}.brand span,nav a span,.who{display:none}.signout{margin-top:0;padding:9px 10px}.signout span{display:none}nav{flex-direction:row}nav a{padding:10px}}
 @media(max-width:420px){.kpis{grid-template-columns:1fr}}
+/* Mobile responsiveness improvements — layout only */
+@media(max-width:760px){
+  html,body{width:100%;max-width:100%;overflow-x:hidden}
+  .app{display:block;width:100%;min-height:100vh}
+  .side{
+    position:sticky;top:0;height:auto;width:100%;
+    display:grid;grid-template-columns:minmax(0,1fr) auto;
+    align-items:center;gap:8px;padding:10px 12px;
+    overflow:visible;z-index:10;
+  }
+  .brand{font-size:21px;gap:8px;min-width:0}
+  .brand span{display:inline}
+  .brand svg{width:30px;height:30px;flex:none}
+  nav{
+    grid-column:1/-1;grid-row:2;
+    display:grid;grid-template-columns:repeat(3,minmax(0,1fr));
+    align-items:stretch;gap:6px;width:100%;min-width:0;
+    overflow:visible;padding:4px 0 2px;
+  }
+  nav a{
+    display:flex;min-width:0;justify-content:center;align-items:center;gap:6px;
+    padding:8px 5px;font-size:12px;white-space:nowrap;
+    border-radius:8px;background:rgba(255,255,255,.14);
+  }
+  nav a span{display:inline;overflow:hidden;text-overflow:ellipsis}
+  nav svg{width:16px;height:16px;flex:none}
+  .who{display:none}
+  .signout{
+    grid-column:2;grid-row:1;
+    display:inline-flex;align-items:center;gap:7px;
+    margin:0;padding:9px 11px;white-space:nowrap;
+  }
+  .signout span{display:inline}
+  main{width:100%;min-width:0;padding:20px 14px 36px}
+  .top{align-items:flex-start;gap:12px}
+  .top>div{min-width:0;flex:1}
+  .top h1{font-size:clamp(24px,6vw,32px);overflow-wrap:anywhere}
+  .top>.btn{flex:0 0 auto;max-width:100%;white-space:normal}
+  .kpis{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+  .kpi{min-width:0;padding:14px}
+  .kpi b{font-size:clamp(22px,6vw,29px);overflow-wrap:anywhere}
+  .grid,.rc{grid-template-columns:minmax(0,1fr);gap:14px}
+  .card{padding:16px;min-width:0}
+  .chart{gap:5px;height:175px}
+  .col span,.axis div{font-size:10px}
+  .axis{gap:5px}
+  .tools{width:100%;min-width:0}
+  .tools input[type=search]{flex:1 1 100%;min-width:0;width:100%}
+  .tools select{flex:1 1 auto;min-width:0;max-width:100%}
+  .f{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+  .f label{min-width:0}
+  .f input,.f select{width:100%;max-width:100%}
+  .f>.btn{width:100%;min-width:0}
+  .drop{align-items:flex-start;flex-direction:column;padding:16px}
+  .drop input[type=file]{max-width:100%;width:100%;font-size:13px}
+  .tw{width:100%;max-width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch}
+  .tw table{min-width:560px}
+  .paper{position:static;width:100%;max-width:100%;overflow-wrap:anywhere}
+  .rlist{max-height:320px;overflow-y:auto}
+  .month-compare{flex-direction:column;gap:12px}
+  .month-card{width:100%;min-width:0;padding:16px}
+  .month-card .mvalue{font-size:25px;overflow-wrap:anywhere}
+  .stocktake-hero{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+  .stocktake-hero .stat{min-width:0;padding:14px}
+  .stocktake-hero .stat b{font-size:25px;overflow-wrap:anywhere}
+  .weekly-note{align-items:flex-start;padding:14px;gap:12px}
+  .weekly-note>p{min-width:0;overflow-wrap:anywhere}
+  .take-actions{width:100%;display:flex;flex-wrap:wrap}
+  .take-actions .btn{flex:1 1 100%;white-space:normal}
+  .pdf-preview{padding:14px;overflow:hidden}
+  .pdf-preview .pdf-head{gap:8px}
+  .pdf-preview .pdf-head>div{min-width:0;overflow-wrap:anywhere}
+  .toast{width:max-content;max-width:calc(100vw - 28px);text-align:center}
+}
+@media(max-width:420px){
+  main{padding:16px 10px 30px}
+  .side{padding:9px 10px}
+  .brand{font-size:19px}
+  .signout{padding:8px 9px;font-size:12px}
+  nav{grid-template-columns:repeat(3,minmax(0,1fr));gap:5px}
+  nav a{padding:7px 3px;font-size:11px;gap:4px}
+  .top{flex-direction:column;align-items:stretch}
+  .top>.btn{align-self:flex-start}
+  .kpis{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .kpi{padding:12px}
+  .kpi b{font-size:22px}
+  .f{grid-template-columns:minmax(0,1fr)}
+  .stocktake-hero{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .card{padding:13px}
+  .weekly-note{padding:12px}
+  .modal{padding:12px}
+  .modal .paper{padding:20px}
+}
 @media(prefers-reduced-motion:reduce){.toast{transition:none}.modal .paper{animation:none}}
 </style>
 </head>
@@ -593,7 +690,7 @@ tr:last-child td{border-bottom:0}
       <label>Item no.<input id="n-sku" placeholder="CK-1001" autocomplete="off"></label>
       <label>Name<input id="n-name" placeholder="Tidepool Sneaker" autocomplete="off"></label>
       <label>Gender<select id="n-gender"><option>Boy</option><option>Girl</option><option>Unisex</option></select></label>
-      <label>Color<select id="n-color"><option>Black</option><option>Brown</option><option>White</option><option>Blue</option><option>Pink</option></select></label>
+      <label>Color<select id="n-color"><option>Black</option><option>Brown</option><option>White</option></select></label>
       <label>Size<select id="n-size"><option value="">Select size</option><option>27</option><option>28</option><option>29</option><option>30</option><option>31</option><option>32</option><option>33</option><option>34</option><option>35</option><option>36</option></select></label>
       <label>Cost ($)<input id="n-cost" type="number" min="0" step="0.01" inputmode="decimal"></label>
       <label>Price ($)<input id="n-price" type="number" min="0" step="0.01" inputmode="decimal"></label>
@@ -804,11 +901,13 @@ $('addBtn').addEventListener('click',function(){
     $('err').textContent='Fill in item no., name, size, cost and price.';
     return;
   }
+  
   var existing=stock.find(function(x){return x.sku.toLowerCase()===sku.toLowerCase()});
-  if(existing && (existing.name.toLowerCase()!==n.toLowerCase() || existing.size.toLowerCase()!==s.toLowerCase())){
-    $('err').textContent='Item no. '+sku+' already exists with different details. Use a unique item no.';
+  if(existing && existing.name.toLowerCase()!==n.toLowerCase()){
+    $('err').textContent='Item no. '+sku+' already exists with a different name. Please use the exact same name for variants.';
     return;
   }
+  
   $('err').textContent='';
   btn.disabled=true;
   saveStock([{sku:sku,name:n,size:s,gender:g,color:col,cost:c,price:p}]).then(function(res){
@@ -819,7 +918,7 @@ $('addBtn').addEventListener('click',function(){
       ['n-sku','n-name','n-cost','n-price'].forEach(function(i){$(i).value=''});
       $('n-size').value='';
       drawInventory();
-      toast('✓ Stock saved: 1 × '+n+', size '+s+' (item '+sku+') — uploaded by '+(r.by||'you'));
+      toast('✓ Stock saved: 1 × '+n+' ('+col+', size '+s+') [item '+sku+'] — uploaded by '+(r.by||'you'));
     } else {
       var msg=(res&&res.message)?res.message:'Could not save the stock.';
       $('err').textContent=msg;
@@ -839,7 +938,7 @@ $('csv').addEventListener('change',function(e){
       var sku=c[0],name=c[1],gender=c[2]||'Unisex',color=c[3]||'Black',size=c[4],cost=parseFloat(c[5]),price=parseFloat(c[6]);
       if(sku&&name&&size&&!isNaN(cost)&&!isNaN(price)){
         var ex=stock.find(function(x){return x.sku.toLowerCase()===sku.toLowerCase()});
-        if(ex && (ex.name.toLowerCase()!==name.toLowerCase() || ex.size.toLowerCase()!==size.toLowerCase())){bad++;return}
+        if(ex && (ex.name.toLowerCase()!==name.toLowerCase())){bad++;return}
         items.push({sku:sku,name:name,size:size,gender:gender,color:color,cost:cost,price:price});
       } else bad++;
     });

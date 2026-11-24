@@ -24,7 +24,7 @@ try {
     error_log('Cashier stock filter failed: ' . $e->getMessage());
 }
 
-// Get Sales + Items
+// Get Sales + Items (all sales for receipts/history)
 $stmt = $pdo->query("SELECT * FROM sales ORDER BY id DESC");
 $sales = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
@@ -41,6 +41,25 @@ foreach ($sales as $sale) {
     $sale['cashier'] = $sale['cashier_name'];
     
     $salesWithItems[] = $sale;
+}
+
+// --- Today's sales only (for dashboard KPIs) ---
+$today = date('Y-m-d');
+$todaySales = array_values(array_filter($salesWithItems, function ($s) use ($today) {
+    return isset($s['created_at']) && substr((string)$s['created_at'], 0, 10) === $today;
+}));
+
+$todayTotal = 0.0;
+$todayPairs = 0;
+$todayCash = 0.0;
+foreach ($todaySales as $s) {
+    $todayTotal += (float)$s['total_amount'];
+    if (strcasecmp((string)$s['pay'], 'Cash') === 0) {
+        $todayCash += (float)$s['total_amount'];
+    }
+    foreach ($s['items'] as $i) {
+        $todayPairs += (int)$i['qty'];
+    }
 }
 
 // --- NEW: Get real sales total for the past 6 days (excluding today) ---
@@ -79,4 +98,15 @@ try {
     error_log('Cashier notifications failed: ' . $e->getMessage());
 }
 
-echo json_encode(['stock' => $stock, 'sales' => $salesWithItems, 'hist' => $hist, 'notifications' => $notifications]);
+echo json_encode([
+    'stock' => $stock,
+    'sales' => $salesWithItems,
+    'today' => [
+        'sales' => $todaySales,
+        'total' => $todayTotal,
+        'pairs' => $todayPairs,
+        'cash'  => $todayCash,
+    ],
+    'hist' => $hist,
+    'notifications' => $notifications,
+]);
