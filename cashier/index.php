@@ -78,6 +78,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
         };
 
+        $ensureRestockTable = static function (PDO $pdo): void {
+            $pdo->exec('CREATE TABLE IF NOT EXISTS restock_requests (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                item_no VARCHAR(40) NOT NULL,
+                name VARCHAR(120) NOT NULL,
+                color VARCHAR(40) NOT NULL,
+                size VARCHAR(20) NOT NULL,
+                current_qty INT NOT NULL DEFAULT 0,
+                requested_by_id INT NULL,
+                requested_by_name VARCHAR(120) NOT NULL,
+                status VARCHAR(20) NOT NULL DEFAULT \'pending\',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                KEY idx_status (status)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
+        };
+
         if ($action === 'bootstrap') {
             $ensureTable($pdo);
 
@@ -204,6 +220,103 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             exit;
         }
 
+        if ($action === 'request_restock') {
+            $sku   = isset($in['sku']) && is_scalar($in['sku']) ? trim((string)$in['sku']) : '';
+            $name  = isset($in['name']) && is_scalar($in['name']) ? trim((string)$in['name']) : '';
+            $color = isset($in['color']) && is_scalar($in['color']) ? trim((string)$in['color']) : '';
+            $size  = isset($in['size']) && is_scalar($in['size']) ? trim((string)$in['size']) : '';
+            $qty   = isset($in['qty']) && is_numeric($in['qty']) ? max(0, (int)$in['qty']) : 0;
+
+            if ($sku === '' || $name === '') {
+                echo json_encode(['ok' => false, 'error' => 'Missing item details for restock request.']);
+                exit;
+            }
+
+            $ensureRestockTable($pdo);
+            $reqById = isset($user['id']) && is_numeric($user['id']) ? (int)$user['id'] : null;
+            $ins = $pdo->prepare('INSERT INTO restock_requests (item_no, name, color, size, current_qty, requested_by_id, requested_by_name) VALUES (?, ?, ?, ?, ?, ?, ?)');
+            $ins->execute([
+                mb_substr($sku, 0, 40),
+                mb_substr($name, 0, 120),
+                mb_substr($color, 0, 40),
+                mb_substr($size, 0, 20),
+                $qty,
+                $reqById,
+                mb_substr($userName, 0, 120),
+            ]);
+
+            if (file_exists(__DIR__ . '/../log_activity.php')) {
+                require_once __DIR__ . '/../log_activity.php';
+                if (function_exists('log_activity')) {
+                    log_activity($pdo, $user, 'Requested restock', "Item {$sku} ({$name}, {$color}, size {$size}) — {$qty} left");
+                }
+            }
+
+            echo json_encode(['ok' => true]);
+            exit;
+        }
+
+        if ($action === 'change_password') {
+            $curPass = isset($in['current_password']) && is_string($in['current_password']) ? $in['current_password'] : '';
+            $newPass = isset($in['new_password']) && is_string($in['new_password']) ? $in['new_password'] : '';
+            $cfmPass = isset($in['confirm_password']) && is_string($in['confirm_password']) ? $in['confirm_password'] : '';
+
+            if ($curPass === '' || $newPass === '' || $cfmPass === '') {
+                echo json_encode(['ok' => false, 'error' => 'Please fill in all password fields.']);
+                exit;
+            }
+            if (mb_strlen($newPass) < 6) {
+                echo json_encode(['ok' => false, 'error' => 'New password must be at least 6 characters.']);
+                exit;
+            }
+            if ($newPass !== $cfmPass) {
+                echo json_encode(['ok' => false, 'error' => 'New passwords do not match.']);
+                exit;
+            }
+
+            $userId = isset($user['id']) && is_numeric($user['id']) ? (int)$user['id'] : 0;
+            if ($userId <= 0) {
+                echo json_encode(['ok' => false, 'error' => 'Could not identify your account.']);
+                exit;
+            }
+
+            $cols = $pdo->query('SHOW COLUMNS FROM users')->fetchAll(PDO::FETCH_COLUMN);
+            $passCol = in_array('password_hash', $cols, true) ? 'password_hash' : (in_array('password', $cols, true) ? 'password' : '');
+            if ($passCol === '') {
+                echo json_encode(['ok' => false, 'error' => 'Password column not found on users table.']);
+                exit;
+            }
+
+            $stmt = $pdo->prepare("SELECT id, `{$passCol}` AS p_val FROM users WHERE id = ? LIMIT 1");
+            $stmt->execute([$userId]);
+            $row = $stmt->fetch();
+            if (!$row) {
+                echo json_encode(['ok' => false, 'error' => 'User account not found.']);
+                exit;
+            }
+
+            $stored = (string)($row['p_val'] ?? '');
+            $valid = password_verify($curPass, $stored) || hash_equals($stored, $curPass);
+            if (!$valid) {
+                echo json_encode(['ok' => false, 'error' => 'Current password is incorrect.']);
+                exit;
+            }
+
+            $newHash = password_hash($newPass, PASSWORD_DEFAULT);
+            $upd = $pdo->prepare("UPDATE users SET `{$passCol}` = ? WHERE id = ?");
+            $upd->execute([$newHash, $userId]);
+
+            if (file_exists(__DIR__ . '/../log_activity.php')) {
+                require_once __DIR__ . '/../log_activity.php';
+                if (function_exists('log_activity')) {
+                    log_activity($pdo, $user, 'Changed password', 'Updated cashier account password');
+                }
+            }
+
+            echo json_encode(['ok' => true]);
+            exit;
+        }
+
         http_response_code(400);
         echo json_encode(['ok' => false, 'error' => 'Invalid request.']);
     } catch (Throwable $e) {
@@ -253,7 +366,10 @@ nav a[aria-current=page]{background:#1E0F03;color:#FFE8D4}
 nav svg{width:20px;height:20px;flex:none}
 .who{margin-top:auto;font-size:14px;display:flex;gap:10px;align-items:center}
 .avatar{width:38px;height:38px;border-radius:50%;background:#1E0F03;color:#FFE8D4;display:grid;place-items:center;font-weight:700}
-.signout{margin-top:10px;display:inline-flex;align-items:center;gap:8px;padding:9px 14px;border-radius:10px;font:600 13.5px/1 var(--body);color:#FFE8D4;background:rgba(30,15,3,.85);border:1.5px solid rgba(30,15,3,.85)}
+.side-actions{display:flex;flex-direction:column;gap:8px;margin-top:10px}
+.signout{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:9px 14px;border-radius:10px;font:600 13.5px/1 var(--body);color:#FFE8D4;background:rgba(30,15,3,.85);border:1.5px solid rgba(30,15,3,.85)}
+.pwbtn{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:9px 14px;border-radius:10px;font:600 13.5px/1 var(--body);color:#1E0F03;background:rgba(255,255,255,.55);border:1.5px solid rgba(30,15,3,.25)}
+.pwbtn:hover{background:rgba(255,255,255,.8)}
 main{padding:28px clamp(16px,3vw,40px) 48px;min-width:0}
 .view{display:none}.view.on{display:block}
 .top{display:flex;flex-wrap:wrap;gap:14px;justify-content:space-between;align-items:flex-end;margin-bottom:22px}
@@ -261,6 +377,7 @@ main{padding:28px clamp(16px,3vw,40px) 48px;min-width:0}
 .top p{margin:4px 0 0;color:var(--muted)}
 .btn{border:1px solid var(--line);background:var(--surface);padding:10px 16px;border-radius:10px;font-weight:600}
 .btn.primary{background:var(--strong);border-color:var(--strong);color:#fff}
+.btn.sm{padding:6px 11px;font-size:13px;border-radius:8px}
 .btn:disabled{opacity:.45;cursor:not-allowed}
 .cards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin-bottom:18px}
 .kpi{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:16px 18px;min-height:124px;display:flex;flex-direction:column;justify-content:center}
@@ -289,6 +406,7 @@ tr:last-child td{border-bottom:0}
 .tools{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px}
 input,select{border:1px solid var(--line);background:var(--surface);border-radius:10px;padding:9px 12px;min-width:0}
 .tools input[type=search]{flex:1;min-width:160px}
+.tools input.flt{width:130px}
 .sale-dialog{width:min(760px,100%);margin:auto}
 .sale-dialog .paper{max-width:none;width:100%;max-height:calc(100vh - 100px);overflow-y:auto;margin:0;padding:24px}
 .sale-dialog .mbar{max-width:none;width:100%;margin:0 0 8px}
@@ -317,10 +435,12 @@ input,select{border:1px solid var(--line);background:var(--surface);border-radiu
 .paper .row{display:flex;justify-content:space-between;gap:10px;padding:3px 0}
 .paper .row.t{font:800 20px var(--display);border-top:2px solid #241A13;margin-top:6px;padding-top:8px}
 .paper hr{border:0;border-top:1px dashed #999;margin:12px 0}
+.form-stack{display:flex;flex-direction:column;gap:12px;margin-top:12px}
+.form-stack label{display:flex;flex-direction:column;gap:5px;font-weight:600;font-size:14px}
 .toast{position:fixed;left:50%;bottom:calc(20px + env(safe-area-inset-bottom,0px));transform:translateX(-50%);background:#1E0F03;color:#FFE8D4;padding:12px 18px;border-radius:12px;font-weight:600;opacity:0;pointer-events:none;transition:opacity .2s;z-index:60;max-width:90vw}
 .toast.on{opacity:1}
 @media(max-width:980px){.grid{grid-template-columns:1fr}}
-@media(max-width:760px){.app{grid-template-columns:1fr}.cards{grid-template-columns:1fr}.side{position:sticky;height:auto;flex-direction:row;align-items:center;padding:10px 14px;gap:10px;z-index:5}.brand span,nav a span,.who>div:last-child{display:none}.signout span{display:none}nav{flex-direction:row}nav a{padding:10px}}
+@media(max-width:760px){.app{grid-template-columns:1fr}.cards{grid-template-columns:1fr}.side{position:sticky;height:auto;flex-direction:row;align-items:center;padding:10px 14px;gap:10px;z-index:5}.brand span,nav a span,.who>div:last-child{display:none}.signout span,.pwbtn span{display:none}nav{flex-direction:row}nav a{padding:10px}}
 </style>
 </head>
 <body>
@@ -332,7 +452,10 @@ input,select{border:1px solid var(--line);background:var(--surface);border-radiu
     <div class="avatar"><?= htmlspecialchars($initials ?: 'CK') ?></div>
     <div><b><?= htmlspecialchars($userName) ?></b><br>Cashier</div>
   </div>
-  <button type="button" class="signout" id="signoutBtn"><span>Sign out</span></button>
+  <div class="side-actions">
+    <button type="button" class="pwbtn" id="pwBtn"><span>Change password</span></button>
+    <button type="button" class="signout" id="signoutBtn"><span>Sign out</span></button>
+  </div>
 </aside>
 <main>
 <?php if ($loginMsg): ?>
@@ -352,8 +475,15 @@ input,select{border:1px solid var(--line);background:var(--surface);border-radiu
 </section>
 
 <section class="view" id="v-sale">
-  <div class="top"><div><h1>Stock in store</h1><p>Every item no. can have several lines. Each line is one color and size with its own price.</p></div><button class="btn primary" type="button" data-sale-open>New sale</button></div>
-  <div class="card"><div class="tools"><input type="search" id="vq" placeholder="Search item no., product, color or size" aria-label="Search stock"></div><div class="tw"><table><thead><tr><th>Gender</th><th>Item no.</th><th>Product</th><th>Color</th><th>Size</th><th class="r">Price</th><th>Current stock</th></tr></thead><tbody id="stockRows"></tbody></table></div></div>
+  <div class="top"><div><h1>Stock &amp; price lookup</h1><p>Search by item no., product, color, or size to check price and quantity quickly.</p></div><button class="btn primary" type="button" data-sale-open>New sale</button></div>
+  <div class="card">
+    <div class="tools">
+      <input type="search" id="vq" placeholder="Search item no., product, color or size" aria-label="Search stock">
+      <input type="text" class="flt" id="vColor" placeholder="Color (e.g. Navy)" aria-label="Filter by color">
+      <input type="text" class="flt" id="vSize" placeholder="Size (e.g. 30)" aria-label="Filter by size">
+    </div>
+    <div class="tw"><table><thead><tr><th>Gender</th><th>Item no.</th><th>Product</th><th>Color</th><th>Size</th><th class="r">Price</th><th>Current stock</th></tr></thead><tbody id="stockRows"></tbody></table></div>
+  </div>
 </section>
 
 <section class="view" id="v-documents">
@@ -401,6 +531,29 @@ input,select{border:1px solid var(--line);background:var(--surface);border-radiu
     <div style="display:flex;justify-content:flex-end;margin-top:16px"><button class="btn primary" type="button" id="notifOk">Got it</button></div>
   </div>
 </div>
+<div class="modal" id="pwModal" role="dialog" aria-modal="true" aria-labelledby="pwTitle">
+  <div class="paper" style="max-width:420px;width:100%">
+    <h3 id="pwTitle">Change password</h3>
+    <p class="sub" style="margin:4px 0 8px">Update your cashier login password.</p>
+    <form class="form-stack" id="pwForm">
+      <label>Current password<input id="curPw" type="password" autocomplete="current-password" required></label>
+      <label>New password<input id="newPw" type="password" minlength="6" autocomplete="new-password" required></label>
+      <label>Confirm new password<input id="cfmPw" type="password" minlength="6" autocomplete="new-password" required></label>
+      <p id="pwErr" class="neg" role="alert" style="margin:2px 0"></p>
+      <div style="display:flex;gap:10px;margin-top:6px">
+        <button class="btn" type="button" id="pwCancel" style="flex:1">Cancel</button>
+        <button class="btn primary" type="submit" id="pwSave" style="flex:1">Save password</button>
+      </div>
+    </form>
+  </div>
+</div>
+<div class="modal" id="signoutModal" role="dialog" aria-modal="true" aria-labelledby="soTitle">
+  <div class="paper" style="max-width:420px;width:100%">
+    <h3 id="soTitle" style="text-align:center">Sign out</h3>
+    <p class="sub" style="margin:6px 0 20px;text-align:center">Are you sure you want to exit?</p>
+    <div style="display:flex;gap:10px"><button class="btn" type="button" id="soNo" style="flex:1">No, stay</button><button class="btn primary" type="button" id="soYes" style="flex:1">Yes, sign out</button></div>
+  </div>
+</div>
 <div class="toast" id="toast" role="status"></div>
 
 <script>
@@ -413,7 +566,7 @@ function fmtT(d){return new Date(d).toLocaleTimeString([],{hour:'2-digit',minute
 function pill(q){return q===0?'<span class="pill out">Out</span>':q<=5?'<span class="pill low">'+q+' left</span>':'<span class="pill">'+q+'</span>'}
 
 var stock=[], sales=[], hist=[0,0,0,0,0,0], todayData={sales:[],total:0,pairs:0,cash:0};
-var variants=[], recVars={}, variantsLoaded=false, notifIds=[];
+var variants=[], recVars={}, variantsLoaded=false, notifIds=[], requestedRestock={};
 
 function postJson(body){
   return fetch(location.href.split('#')[0],{
@@ -517,7 +670,7 @@ $('notifOk').addEventListener('click',dismissNotifications);
 
 var views=[
   ['dashboard','Dashboard','<rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/>'],
-  ['sale','New sale','<path d="M6 6h15l-2 9H8L6 3H3M9 20h.01M18 20h.01"/>'],
+  ['sale','Stock lookup','<path d="M6 6h15l-2 9H8L6 3H3M9 20h.01M18 20h.01"/>'],
   ['documents','Sales receipts','<path d="M5 3h14v18l-3-2-2 2-2-2-2 2-3 2zM9 8h6M9 12h6"/>']
 ];
 $('nav').innerHTML=views.map(function(v){
@@ -537,10 +690,11 @@ function route(){
 window.addEventListener('hashchange',route);
 
 document.addEventListener('click',function(e){
-  var sale=e.target.closest('[data-sale-open]'),g=e.target.closest('[data-go]'),o=e.target.closest('[data-open]');
+  var sale=e.target.closest('[data-sale-open]'),g=e.target.closest('[data-go]'),o=e.target.closest('[data-open]'),rst=e.target.closest('[data-restock]');
   if(sale){e.preventDefault();openSale();}
   if(g)location.hash=g.dataset.go;
   if(o)openDoc(o.dataset.open);
+  if(rst)requestRestock(+rst.dataset.restock, rst);
 });
 
 function saleRow(s){
@@ -548,15 +702,48 @@ function saleRow(s){
 }
 
 function drawStockRows(){
-  var q=($('vq').value||'').toLowerCase();
+  var q=($('vq').value||'').trim().toLowerCase();
+  var c=($('vColor').value||'').trim().toLowerCase();
+  var s=($('vSize').value||'').trim().toLowerCase();
   var rows=variants.filter(function(v){
-    return !q || (v.sku+' '+v.name+' '+v.color+' '+v.size+' '+v.gender).toLowerCase().indexOf(q)>-1;
+    var matchQ=!q || (v.sku+' '+v.name+' '+v.color+' '+v.size+' '+v.gender).toLowerCase().indexOf(q)>-1;
+    var matchC=!c || String(v.color).toLowerCase().indexOf(c)>-1;
+    var matchS=!s || String(v.size).toLowerCase()===s || String(v.size).toLowerCase().indexOf(s)>-1;
+    return matchQ && matchC && matchS;
   });
   $('stockRows').innerHTML=rows.map(function(v){
-    return '<tr><td>'+esc(v.gender)+'</td><td><b>'+esc(v.sku)+'</b></td><td>'+esc(v.name)+'</td><td>'+esc(v.color)+'</td><td>'+esc(v.size)+'</td><td class="r">'+$m(v.price)+'</td><td><b>'+v.qty+'</b> left</td></tr>';
+    return '<tr><td>'+esc(v.gender)+'</td><td><b>'+esc(v.sku)+'</b></td><td>'+esc(v.name)+'</td><td>'+esc(v.color)+'</td><td>'+esc(v.size)+'</td><td class="r">'+$m(v.price)+'</td><td>'+pill(v.qty)+'</td></tr>';
   }).join('')||'<tr><td colspan="7">'+(variants.length?'No stock lines match your search.':'No stock has been added to the store yet.')+'</td></tr>';
 }
 $('vq').addEventListener('input',drawStockRows);
+$('vColor').addEventListener('input',drawStockRows);
+$('vSize').addEventListener('input',drawStockRows);
+
+var currentLowItems = [];
+function requestRestock(idx, btn){
+  var v = currentLowItems[idx];
+  if(!v)return;
+  var key = (v.sku+'|'+v.color+'|'+v.size).toLowerCase();
+  if(requestedRestock[key])return;
+  if(btn){btn.disabled=true;btn.textContent='Sending...';}
+  postJson({
+    action:'request_restock',
+    sku:v.sku,
+    name:v.name,
+    color:v.color,
+    size:v.size,
+    qty:v.qty
+  }).then(function(res){
+    if(!res || !res.ok){
+      if(btn){btn.disabled=false;btn.textContent='Request restock';}
+      toast((res&&res.error)||'Could not send restock request.');
+      return;
+    }
+    requestedRestock[key]=true;
+    if(btn){btn.disabled=true;btn.textContent='Requested';}
+    toast('Restock request sent to admin for '+v.name+' (size '+v.size+').');
+  });
+}
 
 function drawDash(){
   var tot   = +todayData.total || 0;
@@ -586,6 +773,7 @@ function drawDash(){
     : 'Today is '+(tot >= avg ? 'above' : 'below')+' the 6-day average of '+$m(avg);
 
   var low = variants.filter(function(v){return v.qty <= 5}).sort(function(a,b){return a.qty - b.qty});
+  currentLowItems = low;
   if(!variants.length){
     $('lowSub').textContent = 'Add products to start tracking stock';
     $('low').innerHTML = '<tr><td colspan="2" style="text-align:center;color:var(--muted);padding:24px 10px;">No products have been added to the store yet.</td></tr>';
@@ -594,8 +782,10 @@ function drawDash(){
     $('low').innerHTML = '<tr><td colspan="2" style="text-align:center;color:var(--muted);padding:24px 10px;">All products are well stocked.</td></tr>';
   } else {
     $('lowSub').textContent = low.length+' line'+(low.length===1?'':'s')+' running low (5 pairs or fewer left)';
-    $('low').innerHTML = low.map(function(v){
-      return '<tr><td>'+esc(v.name)+'<br><small style="color:var(--muted)">Item '+esc(v.sku)+' · '+esc(v.color)+' · size '+esc(v.size)+'</small></td><td class="r">'+pill(v.qty)+'</td></tr>';
+    $('low').innerHTML = low.map(function(v, idx){
+      var rkey = (v.sku+'|'+v.color+'|'+v.size).toLowerCase();
+      var done = !!requestedRestock[rkey];
+      return '<tr><td>'+esc(v.name)+'<br><small style="color:var(--muted)">Item '+esc(v.sku)+' · '+esc(v.color)+' · size '+esc(v.size)+'</small></td><td class="r">'+pill(v.qty)+' <button type="button" class="btn sm" data-restock="'+idx+'"'+(done?' disabled':'')+'>'+(done?'Requested':'Request restock')+'</button></td></tr>';
     }).join('');
   }
 
@@ -755,7 +945,57 @@ function closeDoc(){$('modal').classList.remove('on');route()}
 $('cls').addEventListener('click',closeDoc);
 $('saleClose').addEventListener('click',closeSale);
 $('prt').addEventListener('click',function(){window.print()});
-$('signoutBtn').addEventListener('click',function(){window.location.href='../logout.php'});
+
+function openPw(){
+  $('pwForm').reset();
+  $('pwErr').textContent='';
+  $('pwModal').classList.add('on');
+  $('curPw').focus();
+}
+function closePw(){
+  $('pwModal').classList.remove('on');
+  $('pwBtn').focus();
+}
+$('pwBtn').addEventListener('click',openPw);
+$('pwCancel').addEventListener('click',closePw);
+$('pwModal').addEventListener('click',function(e){if(e.target===this)closePw()});
+$('pwForm').addEventListener('submit',function(e){
+  e.preventDefault();
+  $('pwErr').textContent='';
+  var curP=$('curPw').value, newP=$('newPw').value, cfmP=$('cfmPw').value;
+  if(newP.length<6){$('pwErr').textContent='New password must be at least 6 characters.';return;}
+  if(newP!==cfmP){$('pwErr').textContent='New passwords do not match.';return;}
+  $('pwSave').disabled=true;
+  $('pwSave').textContent='Saving...';
+  postJson({
+    action:'change_password',
+    current_password:curP,
+    new_password:newP,
+    confirm_password:cfmP
+  }).then(function(res){
+    $('pwSave').disabled=false;
+    $('pwSave').textContent='Save password';
+    if(!res || !res.ok){
+      $('pwErr').textContent=(res&&res.error)||'Could not update password.';
+      return;
+    }
+    closePw();
+    toast('Password updated.');
+  });
+});
+
+function openSignout(){$('signoutModal').classList.add('on');$('soNo').focus()}
+function closeSignout(){$('signoutModal').classList.remove('on');$('signoutBtn').focus()}
+$('signoutBtn').addEventListener('click',openSignout);
+$('soNo').addEventListener('click',closeSignout);
+$('soYes').addEventListener('click',function(){window.location.href='../logout.php'});
+$('signoutModal').addEventListener('click',function(e){if(e.target===this)closeSignout()});
+document.addEventListener('keydown',function(e){
+  if(e.key==='Escape'){
+    if($('signoutModal').classList.contains('on'))closeSignout();
+    else if($('pwModal').classList.contains('on'))closePw();
+  }
+});
 
 loadData();
 setInterval(loadData,15000);

@@ -50,12 +50,44 @@ function crabkidz_variant_key(string $sku, string $color, string $size): string
     return mb_strtolower(trim($sku)) . '|' . mb_strtolower(trim($color)) . '|' . mb_strtolower(trim($size));
 }
 
-/* ---------- Live data: stock + sales made by cashiers ---------- */
-function crabkidz_live_data(PDO $pdo): array
+function crabkidz_ensure_notification_tables(PDO $pdo): void
 {
-    $out = ['stock' => [], 'sales' => [], 'hist' => [0, 0, 0, 0, 0, 0], 'months' => [], 'serverTime' => date('H:i:s')];
+    $pdo->exec('CREATE TABLE IF NOT EXISTS restock_requests (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        item_no VARCHAR(40) NOT NULL,
+        name VARCHAR(120) NOT NULL,
+        color VARCHAR(40) NOT NULL,
+        size VARCHAR(20) NOT NULL,
+        current_qty INT NOT NULL DEFAULT 0,
+        requested_by_id INT NULL,
+        requested_by_name VARCHAR(120) NOT NULL,
+        status VARCHAR(20) NOT NULL DEFAULT \'pending\',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        KEY idx_status (status)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
 
-    // Stock the admin uploaded, with the quantity the cashiers still have left
+    $pdo->exec('CREATE TABLE IF NOT EXISTS admin_notification_reads (
+        user_id INT NOT NULL,
+        request_id INT NOT NULL,
+        read_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (user_id, request_id),
+        KEY idx_req (request_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
+}
+
+/* ---------- Live data: stock + sales made by cashiers + restock notifications ---------- */
+function crabkidz_live_data(PDO $pdo, int $adminId = 0): array
+{
+    $out = [
+        'stock'         => [],
+        'sales'         => [],
+        'hist'          => [0, 0, 0, 0, 0, 0],
+        'months'        => [],
+        'notifications' => [],
+        'serverTime'    => date('H:i:s'),
+    ];
+
+    // Stock saved in stock_items
     try {
         $rows = $pdo->query(
             'SELECT s.id, s.sku, s.name, s.gender, s.color, s.size, s.qty, s.cost, s.price,
@@ -65,45 +97,15 @@ function crabkidz_live_data(PDO $pdo): array
               ORDER BY s.id'
         )->fetchAll();
 
-        $leftByVariant = [];
-        $leftBySku = [];
-        try {
-            foreach ($pdo->query('SELECT item_no, size, stock_qty FROM products')->fetchAll() as $p) {
-                $skuLower  = mb_strtolower(trim((string)$p['item_no']));
-                $sizeLower = mb_strtolower(trim((string)($p['size'] ?? '')));
-                $qtyVal    = (int)$p['stock_qty'];
-                $leftByVariant[$skuLower . '|' . $sizeLower] = $qtyVal;
-                if (!array_key_exists($skuLower, $leftBySku)) {
-                    $leftBySku[$skuLower] = 0;
-                }
-                $leftBySku[$skuLower] += $qtyVal;
-            }
-        } catch (Throwable $e) {
-            error_log('Crabkidz products read failed: ' . $e->getMessage());
-        }
-
         foreach ($rows as $r) {
-            $skuStr  = (string)$r['sku'];
-            $sizeStr = (string)$r['size'];
-            $vKey    = mb_strtolower(trim($skuStr)) . '|' . mb_strtolower(trim($sizeStr));
-            $sKey    = mb_strtolower(trim($skuStr));
-
-            if (array_key_exists($vKey, $leftByVariant)) {
-                $finalQty = $leftByVariant[$vKey];
-            } elseif (array_key_exists($sKey, $leftBySku)) {
-                $finalQty = (int)$r['qty'];
-            } else {
-                $finalQty = (int)$r['qty'];
-            }
-
             $out['stock'][] = [
                 'id'     => (int)$r['id'],
-                'sku'    => $skuStr,
+                'sku'    => (string)$r['sku'],
                 'name'   => (string)$r['name'],
                 'gender' => (string)$r['gender'],
                 'color'  => (string)$r['color'],
-                'size'   => $sizeStr,
-                'qty'    => $finalQty,
+                'size'   => (string)$r['size'],
+                'qty'    => max(0, (int)$r['qty']),
                 'cost'   => (float)$r['cost'],
                 'price'  => (float)$r['price'],
                 'by'     => (string)($r['uploaded_by'] ?? ''),
@@ -122,6 +124,7 @@ function crabkidz_live_data(PDO $pdo): array
         )->fetchAll();
 
         $byId = [];
+        $byReceiptVariants = [];
         if ($sales) {
             $ids = array_map(static function ($r) { return (int)$r['id']; }, $sales);
             $in  = implode(',', array_fill(0, count($ids), '?'));
@@ -135,26 +138,47 @@ function crabkidz_live_data(PDO $pdo): array
                 $byId[(int)$it['sale_id']][] = [
                     'name'    => (string)$it['name'],
                     'item_no' => (string)$it['item_no'],
+                    'color'   => '',
                     'size'    => (string)$it['size'],
                     'qty'     => (int)$it['qty'],
                     'price'   => (float)$it['price'],
                 ];
             }
+
+            try {
+                $vRows = $pdo->query(
+                    'SELECT receipt_no, item_no, name, color, size, qty, price FROM sale_variants ORDER BY id ASC'
+                )->fetchAll();
+                foreach ($vRows as $vr) {
+                    $byReceiptVariants[(string)$vr['receipt_no']][] = [
+                        'name'    => (string)$vr['name'],
+                        'item_no' => (string)$vr['item_no'],
+                        'color'   => (string)$vr['color'],
+                        'size'    => (string)$vr['size'],
+                        'qty'     => (int)$vr['qty'],
+                        'price'   => (float)$vr['price'],
+                    ];
+                }
+            } catch (Throwable $e) {
+                error_log('Crabkidz sale_variants read failed: ' . $e->getMessage());
+            }
         }
 
         $todayStr = date('Y-m-d');
         foreach ($sales as $r) {
+            $recNo   = (string)$r['receipt_no'];
             $ts      = strtotime((string)$r['created_at']);
             $isToday = substr((string)$r['created_at'], 0, 10) === $todayStr;
+            $items   = !empty($byReceiptVariants[$recNo]) ? $byReceiptVariants[$recNo] : ($byId[(int)$r['id']] ?? []);
             $out['sales'][] = [
-                'id'       => (string)$r['receipt_no'],
+                'id'       => $recNo,
                 'time'     => $isToday ? date('H:i', $ts) : date('d M H:i', $ts),
                 'today'    => $isToday,
                 'customer' => (string)($r['customer'] ?? ''),
                 'cashier'  => (string)($r['cashier_name'] ?? ''),
                 'pay'      => (string)($r['payment_method'] ?? ''),
                 'total'    => (float)$r['total_amount'],
-                'items'    => $byId[(int)$r['id']] ?? [],
+                'items'    => $items,
             ];
         }
 
@@ -179,10 +203,62 @@ function crabkidz_live_data(PDO $pdo): array
         $out['salesError'] = 'Could not load sales from the database.';
     }
 
+    // Restock request notifications from cashiers
+    try {
+        crabkidz_ensure_notification_tables($pdo);
+        if ($adminId > 0) {
+            $stmt = $pdo->prepare(
+                'SELECT r.id, r.item_no, r.name, r.color, r.size, r.current_qty,
+                        r.requested_by_name, r.status, r.created_at,
+                        CASE WHEN ar.request_id IS NOT NULL THEN 1 ELSE 0 END AS is_read
+                   FROM restock_requests r
+                   LEFT JOIN admin_notification_reads ar
+                          ON ar.request_id = r.id AND ar.user_id = ?
+                  ORDER BY r.id DESC'
+            );
+            $stmt->execute([$adminId]);
+        } else {
+            $stmt = $pdo->query(
+                'SELECT id, item_no, name, color, size, current_qty,
+                        requested_by_name, status, created_at, 0 AS is_read
+                   FROM restock_requests
+                  ORDER BY id DESC'
+            );
+        }
+
+        foreach ($stmt->fetchAll() as $nr) {
+            $out['notifications'][] = [
+                'id'                => (int)$nr['id'],
+                'item_no'           => (string)$nr['item_no'],
+                'name'              => (string)$nr['name'],
+                'color'             => (string)$nr['color'],
+                'size'              => (string)$nr['size'],
+                'current_qty'       => (int)$nr['current_qty'],
+                'requested_by_name' => (string)$nr['requested_by_name'],
+                'status'            => (string)$nr['status'],
+                'created_at'        => (string)$nr['created_at'],
+                'is_read'           => (int)$nr['is_read'] === 1,
+            ];
+        }
+    } catch (Throwable $e) {
+        error_log('Crabkidz notifications read failed: ' . $e->getMessage());
+    }
+
     return $out;
 }
 
 require_once __DIR__ . '/../log_activity.php';
+
+function crabkidz_current_admin_id(PDO $pdo, array $user): int
+{
+    $uid = isset($user['id']) && is_numeric($user['id']) ? (int)$user['id'] : 0;
+    if ($uid <= 0 && !empty($user['email'])) {
+        $q = $pdo->prepare('SELECT id FROM users WHERE email = ? LIMIT 1');
+        $q->execute([(string)$user['email']]);
+        $uid = (int)($q->fetchColumn() ?: 0);
+    }
+    return $uid;
+}
 
 /* ---------- Small JSON helper ---------- */
 function crabkidz_json(array $payload, int $code = 200): void
@@ -195,22 +271,74 @@ function crabkidz_json(array $payload, int $code = 200): void
 }
 
 
-/* ---------- Save new stock (AJAX POST) ---------- */
+/* ---------- AJAX POST actions ---------- */
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     header('Content-Type: application/json; charset=utf-8');
 
     $in = json_decode((string)file_get_contents('php://input'), true);
 
-    // Live refresh: stock + sales made in the cashier profile
+    // Live refresh: stock + sales + notifications
     if (is_array($in) && ($in['action'] ?? '') === 'get_data') {
         try {
-            echo json_encode(crabkidz_live_data(crabkidz_db()));
+            $pdo = crabkidz_db();
+            $uid = crabkidz_current_admin_id($pdo, $user);
+            echo json_encode(crabkidz_live_data($pdo, $uid));
         } catch (Throwable $e) {
             error_log('Crabkidz get_data failed: ' . $e->getMessage());
             http_response_code(500);
             echo json_encode(['error' => 'Could not load data.']);
         }
         exit;
+    }
+
+    // Mark notification as read or unread in DB
+    if (is_array($in) && ($in['action'] ?? '') === 'set_notification_read') {
+        $reqId  = isset($in['id']) && is_numeric($in['id']) ? (int)$in['id'] : 0;
+        $isRead = !empty($in['is_read']);
+        if ($reqId < 1) {
+            crabkidz_json(['ok' => false, 'message' => 'Invalid notification id.'], 400);
+        }
+        try {
+            $pdo = crabkidz_db();
+            crabkidz_ensure_notification_tables($pdo);
+            $uid = crabkidz_current_admin_id($pdo, $user);
+            if ($uid <= 0) {
+                crabkidz_json(['ok' => false, 'message' => 'Could not identify admin user.'], 400);
+            }
+            if ($isRead) {
+                $pdo->prepare(
+                    'INSERT IGNORE INTO admin_notification_reads (user_id, request_id) VALUES (?, ?)'
+                )->execute([$uid, $reqId]);
+            } else {
+                $pdo->prepare(
+                    'DELETE FROM admin_notification_reads WHERE user_id = ? AND request_id = ?'
+                )->execute([$uid, $reqId]);
+            }
+            crabkidz_json(['ok' => true, 'id' => $reqId, 'is_read' => $isRead]);
+        } catch (Throwable $e) {
+            error_log('Crabkidz set_notification_read failed: ' . $e->getMessage());
+            crabkidz_json(['ok' => false, 'message' => 'Could not update notification status.'], 500);
+        }
+    }
+
+    // Mark all notifications as read in DB
+    if (is_array($in) && ($in['action'] ?? '') === 'mark_all_notifications_read') {
+        try {
+            $pdo = crabkidz_db();
+            crabkidz_ensure_notification_tables($pdo);
+            $uid = crabkidz_current_admin_id($pdo, $user);
+            if ($uid <= 0) {
+                crabkidz_json(['ok' => false, 'message' => 'Could not identify admin user.'], 400);
+            }
+            $pdo->prepare(
+                'INSERT IGNORE INTO admin_notification_reads (user_id, request_id)
+                 SELECT ?, id FROM restock_requests'
+            )->execute([$uid]);
+            crabkidz_json(['ok' => true]);
+        } catch (Throwable $e) {
+            error_log('Crabkidz mark_all_notifications_read failed: ' . $e->getMessage());
+            crabkidz_json(['ok' => false, 'message' => 'Could not mark notifications as read.'], 500);
+        }
     }
 
     // Save an applied stock take so the cashiers see the corrected counts too
@@ -222,9 +350,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $pdo->beginTransaction();
 
             $uItemById      = $pdo->prepare('UPDATE stock_items SET qty = ? WHERE id = ?');
-            $uItemByVariant = $pdo->prepare('UPDATE stock_items SET qty = ? WHERE sku = ? AND color = ? AND size = ?');
-            $uProdByVariant = $pdo->prepare('UPDATE products SET stock_qty = ? WHERE item_no = ? AND size = ?');
-            $uProdBySku     = $pdo->prepare('UPDATE products SET stock_qty = ? WHERE item_no = ?');
+            $uItemByVariant = $pdo->prepare('UPDATE stock_items SET qty = ? WHERE LOWER(sku) = LOWER(?) AND LOWER(color) = LOWER(?) AND LOWER(size) = LOWER(?)');
+            $uProdByVariant = $pdo->prepare('UPDATE products SET stock_qty = ? WHERE LOWER(item_no) = LOWER(?) AND LOWER(size) = LOWER(?)');
+            $uProdBySku     = $pdo->prepare('UPDATE products SET stock_qty = ? WHERE LOWER(item_no) = LOWER(?)');
 
             $n = 0;
             foreach ($items as $it) {
@@ -332,7 +460,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             $sku = (string)$old['sku'];
 
-            // Another line with the same item no. + color + size would clash
             $dup = $pdo->prepare('SELECT id FROM stock_items WHERE LOWER(sku) = LOWER(?) AND LOWER(color) = LOWER(?) AND LOWER(size) = LOWER(?) AND id <> ? LIMIT 1');
             $dup->execute([$sku, $color, $size, $id]);
             if ($dup->fetchColumn() !== false) {
@@ -343,14 +470,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $pdo->prepare('UPDATE stock_items SET name = ?, gender = ?, color = ?, size = ?, qty = ?, cost = ?, price = ? WHERE id = ?')
                 ->execute([$name, $gender, $color, $size, $qty, $cost, $price, $id]);
 
-            // One item no. = one shoe name, so a rename applies to every variant of that item no.
             $renamed = mb_strtolower((string)$old['name']) !== mb_strtolower($name);
             if ($renamed) {
                 $pdo->prepare('UPDATE stock_items SET name = ? WHERE LOWER(sku) = LOWER(?)')->execute([$name, $sku]);
                 $pdo->prepare('UPDATE products SET name = ? WHERE LOWER(item_no) = LOWER(?)')->execute([$name, $sku]);
             }
 
-            // Cashier side: products are kept per item no. + size
             $oldSize     = (string)$old['size'];
             $sizeChanged = mb_strtolower($oldSize) !== mb_strtolower($size);
 
@@ -370,9 +495,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $target = $pOld;
             if ($sizeChanged) {
                 if ($pNew === false && $pOld !== false && !$othersUseOldSize) {
-                    $target = $pOld;            // simply move the product to its new size
+                    $target = $pOld;
                 } else {
-                    $target = $pNew;            // use / create the product for the new size
+                    $target = $pNew;
                     if ($pOld !== false && $pNew !== false && !$othersUseOldSize) {
                         $pdo->prepare('UPDATE products SET stock_qty = 0 WHERE id = ?')->execute([(int)$pOld]);
                     }
@@ -417,7 +542,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
             $pdo->prepare('DELETE FROM stock_items WHERE id = ?')->execute([$id]);
 
-            // Remove the cashier's product too, unless another colour still uses it or it already has sales
             $others = $pdo->prepare('SELECT COUNT(*) FROM stock_items WHERE LOWER(sku) = LOWER(?) AND LOWER(size) = LOWER(?)');
             $others->execute([(string)$old['sku'], (string)$old['size']]);
             if ((int)$others->fetchColumn() === 0) {
@@ -430,7 +554,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     if ((int)$used->fetchColumn() === 0) {
                         $pdo->prepare('DELETE FROM products WHERE id = ?')->execute([(int)$pid]);
                     } else {
-                        // Keep it so past receipts still show, but nothing is left to sell
                         $pdo->prepare('UPDATE products SET stock_qty = 0 WHERE id = ?')->execute([(int)$pid]);
                     }
                 }
@@ -452,11 +575,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         exit;
     }
 
-    // Who is uploading: always taken from the signed-in session, never from the browser
     $uploaderName = trim((string)($user['full_name'] ?? 'Admin'));
     $uploaderId   = isset($user['id']) ? (int)$user['id'] : 0;
 
-    // Clean and validate each row
     $clean   = [];
     $skipped = 0;
     foreach ($in['items'] as $it) {
@@ -504,7 +625,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     try {
         $pdo = crabkidz_db();
 
-        // Fallback: find the uploader's id by email if the session has no id
         if ($uploaderId <= 0 && !empty($user['email'])) {
             $q = $pdo->prepare('SELECT id FROM users WHERE email = ? LIMIT 1');
             $q->execute([(string)$user['email']]);
@@ -514,8 +634,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $pdo->beginTransaction();
 
-        // Track shoe type name per item_no (sku) so one item_no represents one shoe model/type
-        // while allowing different sizes, colors, and prices under that same item_no
         $skuNameLookup = $pdo->prepare('SELECT name FROM stock_items WHERE LOWER(sku) = LOWER(?) LIMIT 1');
         $prodSkuNameLookup = $pdo->prepare('SELECT name FROM products WHERE LOWER(item_no) = LOWER(?) LIMIT 1');
 
@@ -536,7 +654,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
               WHERE id = ?'
         );
 
-        // Keep cashier's `products` table per size/variant so each size keeps its own price & stock
         $pSelVariant = $pdo->prepare('SELECT id FROM products WHERE LOWER(item_no) = LOWER(?) AND LOWER(size) = LOWER(?) LIMIT 1');
         $pUpdVariant = $pdo->prepare(
             'UPDATE products
@@ -557,7 +674,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         foreach ($clean as $r) {
             $skuKey = mb_strtolower($r['sku']);
 
-            // Determine canonical shoe name for this item_no (sku)
             $expectedName = $batchSkuNames[$skuKey] ?? null;
             if ($expectedName === null) {
                 $skuNameLookup->execute([$r['sku']]);
@@ -574,7 +690,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
 
             if ($expectedName !== null && mb_strtolower($expectedName) !== mb_strtolower($r['name'])) {
-                // Same item_no must represent the same shoe type/name
                 $skipped++;
                 continue;
             }
@@ -619,7 +734,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             exit;
         }
 
-        // Notify cashiers: one notification per upload
         $lines = [];
         foreach (array_slice($saved, 0, 10) as $r) {
             $lines[] = $r['qty'] . ' × ' . $r['name'] . ' (' . $r['color'] . ', size ' . $r['size'] . ', $' . number_format((float)$r['price'], 2) . ') [item ' . $r['sku'] . ']';
@@ -656,11 +770,12 @@ if (empty($_SESSION['activity_login_logged'])) {
     }
 }
 
-/* ---------- Load stock + sales for the first paint ---------- */
+/* ---------- Load stock + sales + notifications for the first paint ---------- */
 $live         = null;
 $dbStockError = '';
 try {
-    $live = crabkidz_live_data(crabkidz_db());
+    $pdo = crabkidz_db();
+    $live = crabkidz_live_data($pdo, crabkidz_current_admin_id($pdo, $user));
     $dbStockError = (string)($live['stockError'] ?? $live['salesError'] ?? '');
 } catch (Throwable $e) {
     error_log('Crabkidz initial load failed: ' . $e->getMessage());
@@ -693,6 +808,8 @@ nav a{display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:1
 nav a:hover{background:rgba(255,255,255,.25)}
 nav a[aria-current=page]{background:#1E0F03;color:#FFE8D4}
 nav svg{width:20px;height:20px;flex:none}
+.nav-badge{margin-left:auto;background:#1E0F03;color:#FFE8D4;border-radius:999px;padding:1px 8px;font-size:12px;font-weight:700}
+nav a[aria-current=page] .nav-badge{background:var(--orange);color:#1E0F03}
 .who{margin-top:auto;font-size:14px;display:flex;gap:10px;align-items:center}
 .avatar{width:38px;height:38px;border-radius:50%;background:#1E0F03;color:#FFE8D4;display:grid;place-items:center;font-weight:700}
 .signout{margin-top:10px;display:inline-flex;align-items:center;gap:8px;padding:9px 14px;border-radius:10px;font:600 13.5px/1 var(--body);color:#FFE8D4;background:rgba(30,15,3,.85);border:1.5px solid rgba(30,15,3,.85);cursor:pointer;transition:background .15s ease,color .15s ease,transform .05s ease;}
@@ -730,6 +847,7 @@ table{width:100%;border-collapse:collapse;min-width:560px}
 th{text-align:left;font-weight:600;color:var(--muted);font-size:14px;padding:8px 10px;border-bottom:1px solid var(--line)}
 td{padding:11px 10px;border-bottom:1px solid var(--line);font-variant-numeric:tabular-nums}
 tr:last-child td{border-bottom:0}
+tr.row-unread{background:rgba(242,107,15,.06)}
 .r{text-align:right}
 .link{background:none;border:0;color:var(--strong);font-weight:600;padding:0;text-decoration:underline}
 .pill{display:inline-block;padding:3px 10px;border-radius:999px;font-size:13px;font-weight:600;background:var(--goodbg);color:var(--good)}
@@ -1040,13 +1158,59 @@ tr:last-child td{border-bottom:0}
   </div>
 </section>
 
+<section class="view" id="v-notifications">
+  <div class="top">
+    <div><h1>Stock request notifications</h1><p>Restock requests sent by cashiers, showing read and unread status (20 per page).</p></div>
+    <button class="btn primary" id="markAllReadBtn" type="button">Mark all as read</button>
+  </div>
+  <div class="card">
+    <div class="tools">
+      <input type="search" id="nq" placeholder="Search item no., shoe, color, size or cashier" aria-label="Search notifications">
+      <select id="nFilter" aria-label="Filter read or unread">
+        <option value="all">All notifications</option>
+        <option value="unread">Unread</option>
+        <option value="read">Read</option>
+      </select>
+    </div>
+    <div class="tw">
+      <table>
+        <thead><tr><th>Status</th><th>Item no.</th><th>Shoe</th><th>Color</th><th>Size</th><th class="r">Left</th><th>Requested by</th><th>Date</th><th class="r">Action</th></tr></thead>
+        <tbody id="ntbody"></tbody>
+      </table>
+    </div>
+    <div class="inv-pager" id="notifPager">
+      <span class="sub" id="notifPageInfo" style="margin:0"></span>
+      <div class="pager-btns">
+        <button class="btn" id="notifPrevBtn" type="button">Previous</button>
+        <span class="pager-pos" id="notifPagePos">Page 0 of 0</span>
+        <button class="btn" id="notifNextBtn" type="button">Next</button>
+      </div>
+    </div>
+  </div>
+</section>
+
 </main>
 </div>
 <div class="toast" id="toast" role="status"></div>
 
 <script>
+var $=function(i){return document.getElementById(i)};
+function $m(n){return '$'+Number(n||0).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}
+function esc(s){return String(s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
+function itemsText(s){return (s.items||[]).map(function(i){return esc(i.name)+' '+i.size+(i.qty>1?' ×'+i.qty:'')}).join(', ')}
+function toast(m){var t=$('toast');if(!t)return;t.textContent=m;t.classList.add('on');clearTimeout(toast.h);toast.h=setTimeout(function(){t.classList.remove('on')},2600)}
+function pillFor(q){return q===0?'<span class="pill out">Out</span>':q<=5?'<span class="pill low">'+q+' left</span>':'<span class="pill">'+q+'</span>'}
+function fmtNotifDate(dt){
+  if(!dt)return '—';
+  var d=new Date(String(dt).replace(' ','T'));
+  if(isNaN(d.getTime()))return esc(dt);
+  return d.toLocaleDateString(undefined,{day:'numeric',month:'short',year:'numeric'})+' '+d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+}
+
 /* ---------- Data ---------- */
 var stock=[];
+var notifications=[];
+var sales=[];
 function variantKey(sku,col,size){
   return String(sku||'').trim().toLowerCase()+'|'+String(col||'').trim().toLowerCase()+'|'+String(size||'').trim().toLowerCase();
 }
@@ -1087,31 +1251,23 @@ function addStock(sku,n,s,q,c,p,g,col,by,id){
   return f;
 }
 
-var sales=[];
-
 /* Stock saved in the database (loaded by PHP) */
 var live=<?= json_encode($live, JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT|JSON_UNESCAPED_UNICODE|JSON_PARTIAL_OUTPUT_ON_ERROR) ?>;
 var dbStockError=<?= json_encode($dbStockError, JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT) ?>;
 var todaySales=[],hist=[0,0,0,0,0,0],months=[],selRc=null,lastSync='';
 function applyLive(d){
-  if(!d)return;
+  if(!d||typeof d!=='object')return;
   stock.length=0;
   (d.stock||[]).forEach(function(r){addStock(r.sku,r.name,r.size,r.qty,r.cost,r.price,r.gender,r.color,r.by,r.id)});
   sales=(d.sales||[]).slice().reverse();
   todaySales=sales.filter(function(s){return s.today});
-  hist=d.hist||[0,0,0,0,0,0];
-  months=d.months||[];
+  hist=Array.isArray(d.hist)?d.hist:[0,0,0,0,0,0];
+  months=Array.isArray(d.months)?d.months:[];
+  notifications=Array.isArray(d.notifications)?d.notifications:[];
   lastSync=d.serverTime||'';
   if(!sales.some(function(x){return x.id===selRc}))selRc=sales.length?sales[sales.length-1].id:null;
+  updateNavBadge();
 }
-applyLive(live);
-
-var $=function(i){return document.getElementById(i)};
-function $m(n){return '$'+Number(n||0).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}
-function esc(s){return String(s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
-function itemsText(s){return s.items.map(function(i){return esc(i.name)+' '+i.size+(i.qty>1?' ×'+i.qty:'')}).join(', ')}
-function toast(m){var t=$('toast');t.textContent=m;t.classList.add('on');clearTimeout(toast.h);toast.h=setTimeout(function(){t.classList.remove('on')},2600)}
-function pillFor(q){return q===0?'<span class="pill out">Out</span>':q<=5?'<span class="pill low">'+q+' left</span>':'<span class="pill">'+q+'</span>'}
 
 /* ---------- Modals ---------- */
 function openModal(id,html,onClose){
@@ -1149,21 +1305,48 @@ function postJSON(payload){
 }
 
 /* ---------- Nav ---------- */
-var views=[['dashboard','Sales monitor','<rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/>'],['sales','Sales','<path d="M6 6h15l-2 9H8L6 3H3M9 20h.01M18 20h.01"/>'],['receipts','Receipts','<path d="M5 3h14v18l-3-2-2 2-2-2-2 2-2-2-3 2zM9 8h6M9 12h6"/>'],['upload','Upload stock','<path d="M12 16V4M7 9l5-5 5 5M4 20h16"/>'],['stocktake','Stock take','<path d="M9 4h6v3H9zM6 5H5v16h14V5h-1M9 14l2 2 4-4"/>']];
-$('nav').innerHTML=views.map(function(v){return '<a href="#'+v[0]+'"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'+v[2]+'</svg><span>'+v[1]+'</span></a>'}).join('');
+var views=[
+  ['dashboard','Sales monitor','<rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/>'],
+  ['sales','Sales','<path d="M6 6h15l-2 9H8L6 3H3M9 20h.01M18 20h.01"/>'],
+  ['receipts','Receipts','<path d="M5 3h14v18l-3-2-2 2-2-2-2 2-3 2zM9 8h6M9 12h6"/>'],
+  ['upload','Upload stock','<path d="M12 16V4M7 9l5-5 5 5M4 20h16"/>'],
+  ['stocktake','Stock take','<path d="M9 4h6v3H9zM6 5H5v16h14V5h-1M9 14l2 2 4-4"/>'],
+  ['notifications','Notifications','<path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9M13.73 21a2 2 0 0 1-3.46 0"/>']
+];
+$('nav').innerHTML=views.map(function(v){
+  var badge=v[0]==='notifications'?'<span class="nav-badge" id="notifBadge" style="display:none">0</span>':'';
+  return '<a href="#'+v[0]+'"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'+v[2]+'</svg><span>'+v[1]+'</span>'+badge+'</a>';
+}).join('');
 $('nav').insertAdjacentHTML('beforeend','<a href="activity.php"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg><span>Activity</span></a>');
-function route(){var h=(location.hash||'#dashboard').slice(1);if(!views.some(function(v){return v[0]===h}))h='dashboard';
-  views.forEach(function(v){$('v-'+v[0]).classList.toggle('on',v[0]===h)});
-  document.querySelectorAll('#nav a').forEach(function(a){if(a.getAttribute('href')==='#'+h)a.setAttribute('aria-current','page');else a.removeAttribute('aria-current')});
-  if(h==='dashboard')drawDash();if(h==='sales')drawSales();if(h==='receipts')drawReceipts();if(h==='upload')drawInventory();if(h==='stocktake')drawTake();
-  window.scrollTo(0,0)}
+
+function updateNavBadge(){
+  var b=$('notifBadge');
+  if(!b)return;
+  var unread=notifications.filter(function(n){return !n.is_read}).length;
+  b.textContent=unread;
+  b.style.display=unread>0?'inline-block':'none';
+}
+
+applyLive(live);
+
+function route(){
+  var h=(location.hash||'#dashboard').slice(1);
+  if(!views.some(function(v){return v[0]===h}))h='dashboard';
+  views.forEach(function(v){var el=$('v-'+v[0]);if(el)el.classList.toggle('on',v[0]===h)});
+  document.querySelectorAll('#nav a').forEach(function(a){
+    if(a.getAttribute('href')==='#'+h)a.setAttribute('aria-current','page');else a.removeAttribute('aria-current');
+  });
+  var fn={dashboard:drawDash,sales:drawSales,receipts:drawReceipts,upload:drawInventory,stocktake:drawTake,notifications:drawNotifications}[h];
+  if(typeof fn==='function')fn();
+  window.scrollTo(0,0);
+}
 window.addEventListener('hashchange',route);
 document.addEventListener('click',function(e){var g=e.target.closest('[data-go]');if(g)location.hash=g.dataset.go;
   var r=e.target.closest('[data-rc]');if(r){selRc=r.dataset.rc;if(location.hash==='#receipts')drawReceipts();else location.hash='receipts'}});
 
 /* ---------- Dashboard ---------- */
 function drawDash(){
-  var tot=todaySales.reduce(function(t,s){return t+s.total},0),pairs=todaySales.reduce(function(t,s){return t+s.items.reduce(function(a,i){return a+i.qty},0)},0);
+  var tot=todaySales.reduce(function(t,s){return t+s.total},0),pairs=todaySales.reduce(function(t,s){return t+(s.items||[]).reduce(function(a,i){return a+i.qty},0)},0);
   $('today').textContent='Live totals for '+new Date().toLocaleDateString(undefined,{weekday:'long',month:'long',day:'numeric'})+'.'+(lastSync?' Updated '+lastSync+'.':'');
   $('kpis').innerHTML='<div class="kpi hero"><small>Sales today</small><b>'+$m(tot)+'</b></div><div class="kpi"><small>Receipts</small><b>'+todaySales.length+'</b></div><div class="kpi"><small>Pairs sold</small><b>'+pairs+'</b></div><div class="kpi"><small>Average basket</small><b>'+$m(todaySales.length?tot/todaySales.length:0)+'</b></div>';
 
@@ -1228,7 +1411,97 @@ function drawReceipts(){
   $('rlist').innerHTML=sales.slice().reverse().map(function(s){return '<button data-rc="'+s.id+'" aria-pressed="'+(s.id===selRc)+'"><span><b>#'+s.id+'</b><br><small style="color:var(--muted)">'+s.time+' · '+s.pay+'</small></span><b>'+$m(s.total)+'</b></button>'}).join('');
   var s=sales.find(function(x){return x.id===selRc});
   if(!s){$('paper').innerHTML='<h3>crabkidz</h3><div class="c">No receipts yet</div>';return}
-  $('paper').innerHTML='<h3>crabkidz</h3><div class="c">Shoes for little feet<br>Receipt #'+s.id+' · '+s.time+'</div><hr>'+s.items.map(function(i){return '<div class="row"><span>'+esc(i.name)+'<br>Size '+i.size+' × '+i.qty+'</span><span>'+$m(i.qty*i.price)+'</span></div>'}).join('')+'<hr><div class="row tot"><span>Total</span><span>'+$m(s.total)+'</span></div><div class="row"><span>Paid by</span><span>'+s.pay+'</span></div><div class="row"><span>Served by</span><span>'+s.cashier+'</span></div><hr><div class="c">Thank you for shopping at Crabkidz!</div>'}
+  $('paper').innerHTML='<h3>crabkidz</h3><div class="c">Shoes for little feet<br>Receipt #'+s.id+' · '+s.time+'</div><hr>'+(s.items||[]).map(function(i){return '<div class="row"><span>'+esc(i.name)+(i.color?' ('+esc(i.color)+')':'')+'<br>Size '+i.size+' × '+i.qty+'</span><span>'+$m(i.qty*i.price)+'</span></div>'}).join('')+'<hr><div class="row tot"><span>Total</span><span>'+$m(s.total)+'</span></div><div class="row"><span>Paid by</span><span>'+s.pay+'</span></div><div class="row"><span>Served by</span><span>'+s.cashier+'</span></div><hr><div class="c">Thank you for shopping at Crabkidz!</div>'}
+
+/* ---------- Notifications (Read / Unread + 20 per page pagination) ---------- */
+var NOTIF_PAGE_SIZE=20;
+var notifPage=0;
+
+function getFilteredNotifications(){
+  var q=($('nq').value||'').trim().toLowerCase();
+  var f=$('nFilter').value;
+  return notifications.filter(function(n){
+    if(f==='unread' && n.is_read)return false;
+    if(f==='read' && !n.is_read)return false;
+    if(q && (n.item_no+' '+n.name+' '+n.color+' '+n.size+' '+n.requested_by_name+' '+n.created_at).toLowerCase().indexOf(q)===-1)return false;
+    return true;
+  });
+}
+
+function drawNotifications(){
+  updateNavBadge();
+  var filtered=getFilteredNotifications();
+  if(!filtered.length){
+    notifPage=0;
+    $('ntbody').innerHTML='<tr><td colspan="9">No stock request notifications match.</td></tr>';
+    $('notifPageInfo').textContent='Showing 0 of '+notifications.length+' notifications';
+    $('notifPagePos').textContent='Page 0 of 0';
+    $('notifPrevBtn').disabled=true;
+    $('notifNextBtn').disabled=true;
+    return;
+  }
+  var totalPages=Math.ceil(filtered.length/NOTIF_PAGE_SIZE);
+  if(notifPage>=totalPages)notifPage=totalPages-1;
+  if(notifPage<0)notifPage=0;
+
+  var start=notifPage*NOTIF_PAGE_SIZE;
+  var pageRows=filtered.slice(start, start+NOTIF_PAGE_SIZE);
+  $('ntbody').innerHTML=pageRows.map(function(n){
+    var statusPill=n.is_read?'<span class="pill">Read</span>':'<span class="pill low">Unread</span>';
+    var btnLabel=n.is_read?'Mark unread':'Mark read';
+    return '<tr class="'+(n.is_read?'':'row-unread')+'">'
+      +'<td>'+statusPill+'</td>'
+      +'<td><b>'+esc(n.item_no)+'</b></td>'
+      +'<td>'+esc(n.name)+'</td>'
+      +'<td>'+esc(n.color)+'</td>'
+      +'<td>'+esc(n.size)+'</td>'
+      +'<td class="r">'+pillFor(n.current_qty)+'</td>'
+      +'<td>'+esc(n.requested_by_name)+'</td>'
+      +'<td>'+fmtNotifDate(n.created_at)+'</td>'
+      +'<td class="r"><button type="button" class="mini" data-notif-toggle="'+n.id+'" data-next-read="'+(n.is_read?'0':'1')+'">'+btnLabel+'</button></td>'
+      +'</tr>';
+  }).join('');
+  $('notifPageInfo').textContent='Showing '+(start+1)+'–'+(start+pageRows.length)+' of '+filtered.length+' ('+notifications.length+' total · 20 per page)';
+  $('notifPagePos').textContent='Page '+(notifPage+1)+' of '+totalPages;
+  $('notifPrevBtn').disabled=notifPage<=0;
+  $('notifNextBtn').disabled=notifPage>=totalPages-1;
+}
+
+$('nq').addEventListener('input',function(){notifPage=0;drawNotifications()});
+$('nFilter').addEventListener('change',function(){notifPage=0;drawNotifications()});
+$('notifPrevBtn').addEventListener('click',function(){if(notifPage>0){notifPage--;drawNotifications()}});
+$('notifNextBtn').addEventListener('click',function(){
+  var totalPages=Math.ceil(getFilteredNotifications().length/NOTIF_PAGE_SIZE);
+  if(notifPage<totalPages-1){notifPage++;drawNotifications()}
+});
+
+$('ntbody').addEventListener('click',function(e){
+  var btn=e.target.closest('button[data-notif-toggle]');
+  if(!btn)return;
+  var id=parseInt(btn.dataset.notifToggle,10);
+  var nextRead=btn.dataset.nextRead==='1';
+  btn.disabled=true;
+  postJSON({action:'set_notification_read',id:id,is_read:nextRead}).then(function(res){
+    btn.disabled=false;
+    if(!res||!res.ok){toast((res&&res.message)||'Could not update notification status.');return;}
+    var item=notifications.find(function(x){return x.id===id});
+    if(item)item.is_read=nextRead;
+    drawNotifications();
+    toast(nextRead?'Marked notification as read.':'Marked notification as unread.');
+  });
+});
+
+$('markAllReadBtn').addEventListener('click',function(){
+  var btn=$('markAllReadBtn');
+  btn.disabled=true;
+  postJSON({action:'mark_all_notifications_read'}).then(function(res){
+    btn.disabled=false;
+    if(!res||!res.ok){toast((res&&res.message)||'Could not mark all as read.');return;}
+    notifications.forEach(function(x){x.is_read=true});
+    drawNotifications();
+    toast('All notifications marked as read.');
+  });
+});
 
 /* ---------- Inventory (Upload stock — 10 per page + filters) ---------- */
 var INV_PAGE_SIZE=10;
@@ -1351,7 +1624,6 @@ $('invClearFilterBtn').addEventListener('click',function(){
   drawInventory();
 });
 
-/* Save rows to the database. Uploader is picked on the server from the signed-in user. */
 function saveStock(items){
   return fetch(location.href.split('#')[0],{
     method:'POST',
@@ -1393,7 +1665,6 @@ $('addBtn').addEventListener('click',function(){
     if(res && res.ok && res.saved && res.saved.length){
       var r=res.saved[0];
       addStock(r.sku,r.name,r.size,r.qty||q,r.cost,r.price,r.gender,r.color,r.by,r.id);
-      // Keep item no. and name so admin can quickly add another size & price for the same shoe type
       ['n-size','n-cost','n-price'].forEach(function(i){$(i).value=''});
       $('n-qty').value='1';
       $('n-size').focus();
@@ -1498,7 +1769,7 @@ function openEditStock(id){
         drawInventory();
         toast('✓ Stock updated: '+qty+' × '+name+' ('+color+', size '+size+', '+$m(price)+') [item '+s.sku+'] saved successfully.');
       } else {
-        toast('✕ Stock not updated. '+(res&&res.message)?res.message:'Could not save the changes.');
+        toast('✕ Stock not updated. '+((res&&res.message)?res.message:'Could not save the changes.'));
       }
     });
   });
@@ -1525,7 +1796,7 @@ function confirmDeleteStock(id){
       } else {
         btn.disabled=false;
         m.__close(true);
-        toast('✕ Stock not deleted. '+(res&&res.message)?res.message:'Could not delete the stock line.');
+        toast('✕ Stock not deleted. '+((res&&res.message)?res.message:'Could not delete the stock line.'));
       }
     });
   });
@@ -1779,7 +2050,7 @@ document.getElementById('signoutBtn').addEventListener('click', function () {
   }
 });
 
-/* ---------- Live refresh (sales made in the cashier profile) ---------- */
+/* ---------- Live refresh (sales + stock + notifications) ---------- */
 var refreshing=false;
 function refreshData(){
   if(refreshing)return;refreshing=true;
@@ -1791,7 +2062,7 @@ function refreshData(){
     applyLive(d);
     var h=(location.hash||'#dashboard').slice(1);
     if(h==='dashboard')drawDash();else if(h==='sales')drawSales();else if(h==='receipts')drawReceipts();else if(h==='upload')drawInventory();
-    else if(h==='stocktake')updateStats();
+    else if(h==='stocktake')updateStats();else if(h==='notifications')drawNotifications();
   })
   .catch(function(){refreshing=false});
 }
@@ -1800,10 +2071,18 @@ document.addEventListener('visibilitychange',function(){if(!document.hidden)refr
 window.addEventListener('hashchange',refreshData);
 
 /* ---------- Boot ---------- */
-route();
-autoWeeklyCheck();
-if(dbStockError){toast('✕ '+dbStockError)}
+try {
+  route();
+  autoWeeklyCheck();
+  if(dbStockError){toast('✕ '+dbStockError)}
+} catch (err) {
+  console.error('Admin dashboard boot error:', err);
+  var dashEl=$('v-dashboard');
+  if(dashEl)dashEl.classList.add('on');
+  toast('✕ Dashboard render error: '+(err&&err.message?err.message:'Check console'));
+}
 setInterval(autoWeeklyCheck, 60*1000);
 </script>
 </body>
 </html>
+```[cite: 2]
