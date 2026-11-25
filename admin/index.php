@@ -45,6 +45,11 @@ function crabkidz_db(): PDO
     return $conn;
 }
 
+function crabkidz_variant_key(string $sku, string $color, string $size): string
+{
+    return mb_strtolower(trim($sku)) . '|' . mb_strtolower(trim($color)) . '|' . mb_strtolower(trim($size));
+}
+
 /* ---------- Live data: stock + sales made by cashiers ---------- */
 function crabkidz_live_data(PDO $pdo): array
 {
@@ -53,31 +58,52 @@ function crabkidz_live_data(PDO $pdo): array
     // Stock the admin uploaded, with the quantity the cashiers still have left
     try {
         $rows = $pdo->query(
-            'SELECT s.sku, s.name, s.gender, s.color, s.size, s.qty, s.cost, s.price,
+            'SELECT s.id, s.sku, s.name, s.gender, s.color, s.size, s.qty, s.cost, s.price,
                     COALESCE(u.full_name, s.uploaded_by_name) AS uploaded_by
                FROM stock_items s
                LEFT JOIN users u ON u.id = s.uploaded_by
               ORDER BY s.id'
         )->fetchAll();
 
-        $left = [];
+        $leftByVariant = [];
+        $leftBySku = [];
         try {
-            foreach ($pdo->query('SELECT item_no, stock_qty FROM products')->fetchAll() as $p) {
-                $left[strtolower((string)$p['item_no'])] = (int)$p['stock_qty'];
+            foreach ($pdo->query('SELECT item_no, size, stock_qty FROM products')->fetchAll() as $p) {
+                $skuLower  = mb_strtolower(trim((string)$p['item_no']));
+                $sizeLower = mb_strtolower(trim((string)($p['size'] ?? '')));
+                $qtyVal    = (int)$p['stock_qty'];
+                $leftByVariant[$skuLower . '|' . $sizeLower] = $qtyVal;
+                if (!array_key_exists($skuLower, $leftBySku)) {
+                    $leftBySku[$skuLower] = 0;
+                }
+                $leftBySku[$skuLower] += $qtyVal;
             }
         } catch (Throwable $e) {
             error_log('Crabkidz products read failed: ' . $e->getMessage());
         }
 
         foreach ($rows as $r) {
-            $k = strtolower((string)$r['sku']);
+            $skuStr  = (string)$r['sku'];
+            $sizeStr = (string)$r['size'];
+            $vKey    = mb_strtolower(trim($skuStr)) . '|' . mb_strtolower(trim($sizeStr));
+            $sKey    = mb_strtolower(trim($skuStr));
+
+            if (array_key_exists($vKey, $leftByVariant)) {
+                $finalQty = $leftByVariant[$vKey];
+            } elseif (array_key_exists($sKey, $leftBySku)) {
+                $finalQty = (int)$r['qty'];
+            } else {
+                $finalQty = (int)$r['qty'];
+            }
+
             $out['stock'][] = [
-                'sku'    => (string)$r['sku'],
+                'id'     => (int)$r['id'],
+                'sku'    => $skuStr,
                 'name'   => (string)$r['name'],
                 'gender' => (string)$r['gender'],
                 'color'  => (string)$r['color'],
-                'size'   => (string)$r['size'],
-                'qty'    => array_key_exists($k, $left) ? $left[$k] : (int)$r['qty'],
+                'size'   => $sizeStr,
+                'qty'    => $finalQty,
                 'cost'   => (float)$r['cost'],
                 'price'  => (float)$r['price'],
                 'by'     => (string)($r['uploaded_by'] ?? ''),
@@ -158,6 +184,17 @@ function crabkidz_live_data(PDO $pdo): array
 
 require_once __DIR__ . '/../log_activity.php';
 
+/* ---------- Small JSON helper ---------- */
+function crabkidz_json(array $payload, int $code = 200): void
+{
+    if ($code !== 200) {
+        http_response_code($code);
+    }
+    echo json_encode($payload);
+    exit;
+}
+
+
 /* ---------- Save new stock (AJAX POST) ---------- */
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     header('Content-Type: application/json; charset=utf-8');
@@ -178,22 +215,46 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     // Save an applied stock take so the cashiers see the corrected counts too
     if (is_array($in) && ($in['action'] ?? '') === 'apply_stocktake') {
-        $items = is_array($in['items'] ?? null) ? $in['items'] : [];
+        $items   = is_array($in['items'] ?? null) ? $in['items'] : [];
         $details = is_string($in['details'] ?? null) ? mb_substr(trim($in['details']), 0, 300) : '';
         try {
             $pdo = crabkidz_db();
             $pdo->beginTransaction();
-            $uProd = $pdo->prepare('UPDATE products SET stock_qty = ? WHERE item_no = ?');
-            $uItem = $pdo->prepare('UPDATE stock_items SET qty = ? WHERE sku = ?');
+
+            $uItemById      = $pdo->prepare('UPDATE stock_items SET qty = ? WHERE id = ?');
+            $uItemByVariant = $pdo->prepare('UPDATE stock_items SET qty = ? WHERE sku = ? AND color = ? AND size = ?');
+            $uProdByVariant = $pdo->prepare('UPDATE products SET stock_qty = ? WHERE item_no = ? AND size = ?');
+            $uProdBySku     = $pdo->prepare('UPDATE products SET stock_qty = ? WHERE item_no = ?');
+
             $n = 0;
             foreach ($items as $it) {
-                if (!is_array($it) || !isset($it['sku']) || !is_string($it['sku']) || !isset($it['counted']) || !is_numeric($it['counted'])) {
+                if (!is_array($it) || !isset($it['counted']) || !is_numeric($it['counted'])) {
                     continue;
                 }
                 $counted = (int)$it['counted'];
-                if ($counted < 0) { continue; }
-                $uProd->execute([$counted, $it['sku']]);
-                $uItem->execute([$counted, $it['sku']]);
+                if ($counted < 0) {
+                    continue;
+                }
+
+                $id    = isset($it['id']) && is_numeric($it['id']) ? (int)$it['id'] : 0;
+                $sku   = isset($it['sku']) && is_string($it['sku']) ? trim($it['sku']) : '';
+                $color = isset($it['color']) && is_string($it['color']) ? trim($it['color']) : '';
+                $size  = isset($it['size']) && is_string($it['size']) ? trim($it['size']) : '';
+
+                if ($id > 0) {
+                    $uItemById->execute([$counted, $id]);
+                } elseif ($sku !== '' && $color !== '' && $size !== '') {
+                    $uItemByVariant->execute([$counted, $sku, $color, $size]);
+                } elseif ($sku !== '') {
+                    $uProdBySku->execute([$counted, $sku]);
+                }
+
+                if ($sku !== '' && $size !== '') {
+                    $uProdByVariant->execute([$counted, $sku, $size]);
+                } elseif ($sku !== '') {
+                    $uProdBySku->execute([$counted, $sku]);
+                }
+
                 $n++;
             }
             if ($n === 0) {
@@ -230,6 +291,161 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         echo json_encode(['ok' => true]);
         exit;
     }
+
+    /* ----- Edit one stock line (keeps the cashier's products table in step) ----- */
+    if (is_array($in) && ($in['action'] ?? '') === 'edit_stock') {
+        $get = static function (string $k) use ($in): string {
+            return (isset($in[$k]) && is_scalar($in[$k])) ? trim((string)$in[$k]) : '';
+        };
+        $id     = isset($in['id']) && is_numeric($in['id']) ? (int)$in['id'] : 0;
+        $name   = $get('name');
+        $gender = $get('gender') !== '' ? $get('gender') : 'Unisex';
+        $color  = $get('color')  !== '' ? $get('color')  : 'Black';
+        $size   = $get('size');
+        $cost   = $in['cost']  ?? null;
+        $price  = $in['price'] ?? null;
+        $qtyRaw = $in['qty']   ?? null;
+
+        if ($id < 1 || $name === '' || $size === ''
+            || !is_numeric($qtyRaw) || (int)$qtyRaw < 0 || (int)$qtyRaw > 100000
+            || !is_numeric($cost) || !is_numeric($price)
+            || (float)$cost < 0 || (float)$price < 0
+            || (float)$cost > 99999999.99 || (float)$price > 99999999.99
+            || mb_strlen($name) > 120 || mb_strlen($size) > 25
+            || mb_strlen($gender) > 20 || mb_strlen($color) > 40) {
+            crabkidz_json(['ok' => false, 'message' => 'Check the details and try again. Name, size, stock, cost and price are required.']);
+        }
+        $qty   = (int)$qtyRaw;
+        $cost  = round((float)$cost, 2);
+        $price = round((float)$price, 2);
+
+        try {
+            $pdo = crabkidz_db();
+            $pdo->beginTransaction();
+
+            $sel = $pdo->prepare('SELECT id, sku, name, color, size FROM stock_items WHERE id = ? LIMIT 1');
+            $sel->execute([$id]);
+            $old = $sel->fetch();
+            if (!$old) {
+                $pdo->rollBack();
+                crabkidz_json(['ok' => false, 'message' => 'That stock line no longer exists. Refresh the page and try again.']);
+            }
+            $sku = (string)$old['sku'];
+
+            // Another line with the same item no. + color + size would clash
+            $dup = $pdo->prepare('SELECT id FROM stock_items WHERE LOWER(sku) = LOWER(?) AND LOWER(color) = LOWER(?) AND LOWER(size) = LOWER(?) AND id <> ? LIMIT 1');
+            $dup->execute([$sku, $color, $size, $id]);
+            if ($dup->fetchColumn() !== false) {
+                $pdo->rollBack();
+                crabkidz_json(['ok' => false, 'message' => 'Item no. ' . $sku . ' already has a ' . $color . ' line in size ' . $size . '.']);
+            }
+
+            $pdo->prepare('UPDATE stock_items SET name = ?, gender = ?, color = ?, size = ?, qty = ?, cost = ?, price = ? WHERE id = ?')
+                ->execute([$name, $gender, $color, $size, $qty, $cost, $price, $id]);
+
+            // One item no. = one shoe name, so a rename applies to every variant of that item no.
+            $renamed = mb_strtolower((string)$old['name']) !== mb_strtolower($name);
+            if ($renamed) {
+                $pdo->prepare('UPDATE stock_items SET name = ? WHERE LOWER(sku) = LOWER(?)')->execute([$name, $sku]);
+                $pdo->prepare('UPDATE products SET name = ? WHERE LOWER(item_no) = LOWER(?)')->execute([$name, $sku]);
+            }
+
+            // Cashier side: products are kept per item no. + size
+            $oldSize     = (string)$old['size'];
+            $sizeChanged = mb_strtolower($oldSize) !== mb_strtolower($size);
+
+            $pFind = $pdo->prepare('SELECT id FROM products WHERE LOWER(item_no) = LOWER(?) AND LOWER(size) = LOWER(?) LIMIT 1');
+            $pFind->execute([$sku, $oldSize]);
+            $pOld = $pFind->fetchColumn();
+            $pNew = $pOld;
+            if ($sizeChanged) {
+                $pFind->execute([$sku, $size]);
+                $pNew = $pFind->fetchColumn();
+            }
+
+            $others = $pdo->prepare('SELECT COUNT(*) FROM stock_items WHERE LOWER(sku) = LOWER(?) AND LOWER(size) = LOWER(?) AND id <> ?');
+            $others->execute([$sku, $oldSize, $id]);
+            $othersUseOldSize = (int)$others->fetchColumn() > 0;
+
+            $target = $pOld;
+            if ($sizeChanged) {
+                if ($pNew === false && $pOld !== false && !$othersUseOldSize) {
+                    $target = $pOld;            // simply move the product to its new size
+                } else {
+                    $target = $pNew;            // use / create the product for the new size
+                    if ($pOld !== false && $pNew !== false && !$othersUseOldSize) {
+                        $pdo->prepare('UPDATE products SET stock_qty = 0 WHERE id = ?')->execute([(int)$pOld]);
+                    }
+                }
+            }
+
+            if ($target !== false) {
+                $pdo->prepare('UPDATE products SET name = ?, size = ?, price = ?, stock_qty = ? WHERE id = ?')
+                    ->execute([$name, $size, $price, $qty, (int)$target]);
+            } else {
+                $pdo->prepare('INSERT INTO products (item_no, name, size, price, stock_qty, initial_qty) VALUES (?, ?, ?, ?, ?, ?)')
+                    ->execute([$sku, $name, $size, $price, $qty, $qty]);
+            }
+
+            $pdo->commit();
+            log_activity($pdo, $user, 'Stock edited', $qty . ' × ' . $name . ' (' . $color . ', size ' . $size . ', $' . number_format($price, 2) . ') [item ' . $sku . ']');
+            crabkidz_json(['ok' => true, 'id' => $id, 'sku' => $sku, 'renamed' => $renamed]);
+        } catch (Throwable $e) {
+            if (isset($pdo) && $pdo instanceof PDO && $pdo->inTransaction()) { $pdo->rollBack(); }
+            error_log('Crabkidz edit_stock failed: ' . $e->getMessage());
+            crabkidz_json(['ok' => false, 'message' => 'Could not save the changes to the database.'], 500);
+        }
+    }
+
+    /* ----- Delete one stock line ----- */
+    if (is_array($in) && ($in['action'] ?? '') === 'delete_stock') {
+        $id = isset($in['id']) && is_numeric($in['id']) ? (int)$in['id'] : 0;
+        if ($id < 1) {
+            crabkidz_json(['ok' => false, 'message' => 'Invalid request.'], 400);
+        }
+        try {
+            $pdo = crabkidz_db();
+            $pdo->beginTransaction();
+
+            $sel = $pdo->prepare('SELECT id, sku, name, color, size FROM stock_items WHERE id = ? LIMIT 1');
+            $sel->execute([$id]);
+            $old = $sel->fetch();
+            if (!$old) {
+                $pdo->rollBack();
+                crabkidz_json(['ok' => false, 'message' => 'That stock line no longer exists. Refresh the page.']);
+            }
+
+            $pdo->prepare('DELETE FROM stock_items WHERE id = ?')->execute([$id]);
+
+            // Remove the cashier's product too, unless another colour still uses it or it already has sales
+            $others = $pdo->prepare('SELECT COUNT(*) FROM stock_items WHERE LOWER(sku) = LOWER(?) AND LOWER(size) = LOWER(?)');
+            $others->execute([(string)$old['sku'], (string)$old['size']]);
+            if ((int)$others->fetchColumn() === 0) {
+                $pFind = $pdo->prepare('SELECT id FROM products WHERE LOWER(item_no) = LOWER(?) AND LOWER(size) = LOWER(?) LIMIT 1');
+                $pFind->execute([(string)$old['sku'], (string)$old['size']]);
+                $pid = $pFind->fetchColumn();
+                if ($pid !== false) {
+                    $used = $pdo->prepare('SELECT COUNT(*) FROM sale_items WHERE product_id = ?');
+                    $used->execute([(int)$pid]);
+                    if ((int)$used->fetchColumn() === 0) {
+                        $pdo->prepare('DELETE FROM products WHERE id = ?')->execute([(int)$pid]);
+                    } else {
+                        // Keep it so past receipts still show, but nothing is left to sell
+                        $pdo->prepare('UPDATE products SET stock_qty = 0 WHERE id = ?')->execute([(int)$pid]);
+                    }
+                }
+            }
+
+            $pdo->commit();
+            log_activity($pdo, $user, 'Stock deleted', $old['name'] . ' (' . $old['color'] . ', size ' . $old['size'] . ') [item ' . $old['sku'] . ']');
+            crabkidz_json(['ok' => true, 'id' => $id]);
+        } catch (Throwable $e) {
+            if (isset($pdo) && $pdo instanceof PDO && $pdo->inTransaction()) { $pdo->rollBack(); }
+            error_log('Crabkidz delete_stock failed: ' . $e->getMessage());
+            crabkidz_json(['ok' => false, 'message' => 'Could not delete the stock line from the database.'], 500);
+        }
+    }
+
     if (!is_array($in) || ($in['action'] ?? '') !== 'add_stock' || !is_array($in['items'] ?? null) || count($in['items']) > 500) {
         http_response_code(400);
         echo json_encode(['ok' => false, 'message' => 'Invalid request.']);
@@ -255,19 +471,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $color  = $get('color')  !== '' ? $get('color')  : 'Black';
         $cost   = $it['cost']  ?? null;
         $price  = $it['price'] ?? null;
+        $qtyRaw = $it['qty']   ?? 1;
+        $qty    = is_numeric($qtyRaw) ? (int)$qtyRaw : 0;
 
         if ($sku === '' || $name === '' || $size === ''
+            || $qty < 1 || $qty > 100000
             || !is_numeric($cost) || !is_numeric($price)
             || (float)$cost < 0 || (float)$price < 0
             || (float)$cost > 99999999.99 || (float)$price > 99999999.99
-            || mb_strlen($sku) > 40 || mb_strlen($name) > 120 || mb_strlen($size) > 10
+            || mb_strlen($sku) > 40 || mb_strlen($name) > 120 || mb_strlen($size) > 25
             || mb_strlen($gender) > 20 || mb_strlen($color) > 40) {
             $skipped++;
             continue;
         }
         $clean[] = [
-            'sku' => $sku, 'name' => $name, 'size' => $size, 'gender' => $gender, 'color' => $color,
-            'cost' => round((float)$cost, 2), 'price' => round((float)$price, 2),
+            'sku'    => $sku,
+            'name'   => $name,
+            'size'   => $size,
+            'gender' => $gender,
+            'color'  => $color,
+            'qty'    => $qty,
+            'cost'   => round((float)$cost, 2),
+            'price'  => round((float)$price, 2),
         ];
     }
 
@@ -288,56 +513,100 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $uploaderIdOrNull = $uploaderId > 0 ? $uploaderId : null;
 
         $pdo->beginTransaction();
-        
-        // Check if this exact variant (sku + color + size) exists
-        $sel = $pdo->prepare('SELECT name FROM stock_items WHERE sku = ? AND color = ? AND size = ? LIMIT 1');
-        $ins = $pdo->prepare(
-            'INSERT INTO stock_items (sku, name, gender, color, size, qty, cost, price, uploaded_by, uploaded_by_name)
-             VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
-             ON DUPLICATE KEY UPDATE
-               qty = qty + 1,
-               name = VALUES(name),
-               gender = VALUES(gender),
-               cost = VALUES(cost),
-               price = VALUES(price),
-               uploaded_by = VALUES(uploaded_by),
-               uploaded_by_name = VALUES(uploaded_by_name)'
-        );
 
-        // Keep the cashier's `products` table in step with what the admin uploads
-        $pSel = $pdo->prepare('SELECT id FROM products WHERE item_no = ? LIMIT 1');
-        $pUpd = $pdo->prepare(
-            'UPDATE products SET name = ?, size = ?, price = ?,
-                    stock_qty = stock_qty + 1, initial_qty = initial_qty + 1
+        // Track shoe type name per item_no (sku) so one item_no represents one shoe model/type
+        // while allowing different sizes, colors, and prices under that same item_no
+        $skuNameLookup = $pdo->prepare('SELECT name FROM stock_items WHERE LOWER(sku) = LOWER(?) LIMIT 1');
+        $prodSkuNameLookup = $pdo->prepare('SELECT name FROM products WHERE LOWER(item_no) = LOWER(?) LIMIT 1');
+
+        $selVariant = $pdo->prepare('SELECT id, name FROM stock_items WHERE LOWER(sku) = LOWER(?) AND LOWER(color) = LOWER(?) AND LOWER(size) = LOWER(?) LIMIT 1');
+        $insVariant = $pdo->prepare(
+            'INSERT INTO stock_items (sku, name, gender, color, size, qty, cost, price, uploaded_by, uploaded_by_name)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        );
+        $updVariant = $pdo->prepare(
+            'UPDATE stock_items
+                SET qty = qty + ?,
+                    name = ?,
+                    gender = ?,
+                    cost = ?,
+                    price = ?,
+                    uploaded_by = ?,
+                    uploaded_by_name = ?
               WHERE id = ?'
         );
-        $pIns = $pdo->prepare(
+
+        // Keep cashier's `products` table per size/variant so each size keeps its own price & stock
+        $pSelVariant = $pdo->prepare('SELECT id FROM products WHERE LOWER(item_no) = LOWER(?) AND LOWER(size) = LOWER(?) LIMIT 1');
+        $pUpdVariant = $pdo->prepare(
+            'UPDATE products
+                SET name = ?,
+                    price = ?,
+                    stock_qty = stock_qty + ?,
+                    initial_qty = initial_qty + ?
+              WHERE id = ?'
+        );
+        $pInsVariant = $pdo->prepare(
             'INSERT INTO products (item_no, name, size, price, stock_qty, initial_qty)
-             VALUES (?, ?, ?, ?, 1, 1)'
+             VALUES (?, ?, ?, ?, ?, ?)'
         );
 
+        $batchSkuNames = [];
         $saved = [];
+
         foreach ($clean as $r) {
-            $sel->execute([$r['sku'], $r['color'], $r['size']]);
-            $ex = $sel->fetch();
-            
-            if ($ex && mb_strtolower((string)$ex['name']) !== mb_strtolower($r['name'])) {
-                // Exact variant exists but with a completely different name - reject to prevent typos
+            $skuKey = mb_strtolower($r['sku']);
+
+            // Determine canonical shoe name for this item_no (sku)
+            $expectedName = $batchSkuNames[$skuKey] ?? null;
+            if ($expectedName === null) {
+                $skuNameLookup->execute([$r['sku']]);
+                $dbName = $skuNameLookup->fetchColumn();
+                if ($dbName !== false && (string)$dbName !== '') {
+                    $expectedName = (string)$dbName;
+                } else {
+                    $prodSkuNameLookup->execute([$r['sku']]);
+                    $pName = $prodSkuNameLookup->fetchColumn();
+                    if ($pName !== false && (string)$pName !== '') {
+                        $expectedName = (string)$pName;
+                    }
+                }
+            }
+
+            if ($expectedName !== null && mb_strtolower($expectedName) !== mb_strtolower($r['name'])) {
+                // Same item_no must represent the same shoe type/name
                 $skipped++;
                 continue;
             }
 
-            $ins->execute([
-                $r['sku'], $r['name'], $r['gender'], $r['color'], $r['size'],
-                $r['cost'], $r['price'], $uploaderIdOrNull, $uploaderName,
-            ]);
+            $canonicalName = $expectedName ?? $r['name'];
+            $r['name'] = $canonicalName;
+            $batchSkuNames[$skuKey] = $canonicalName;
 
-            $pSel->execute([$r['sku']]);
-            $pid = $pSel->fetchColumn();
-            if ($pid !== false) {
-                $pUpd->execute([$r['name'], $r['size'], $r['price'], (int)$pid]);
+            $selVariant->execute([$r['sku'], $r['color'], $r['size']]);
+            $existingVar = $selVariant->fetch();
+
+            if ($existingVar) {
+                $varId = (int)$existingVar['id'];
+                $updVariant->execute([
+                    $r['qty'], $canonicalName, $r['gender'],
+                    $r['cost'], $r['price'], $uploaderIdOrNull, $uploaderName, $varId
+                ]);
+                $r['id'] = $varId;
             } else {
-                $pIns->execute([$r['sku'], $r['name'], $r['size'], $r['price']]);
+                $insVariant->execute([
+                    $r['sku'], $canonicalName, $r['gender'], $r['color'], $r['size'],
+                    $r['qty'], $r['cost'], $r['price'], $uploaderIdOrNull, $uploaderName,
+                ]);
+                $r['id'] = (int)$pdo->lastInsertId();
+            }
+
+            $pSelVariant->execute([$r['sku'], $r['size']]);
+            $pid = $pSelVariant->fetchColumn();
+            if ($pid !== false) {
+                $pUpdVariant->execute([$canonicalName, $r['price'], $r['qty'], $r['qty'], (int)$pid]);
+            } else {
+                $pInsVariant->execute([$r['sku'], $canonicalName, $r['size'], $r['price'], $r['qty'], $r['qty']]);
             }
 
             $r['by'] = $uploaderName;
@@ -346,14 +615,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         if (!$saved) {
             $pdo->rollBack();
-            echo json_encode(['ok' => false, 'message' => 'Nothing was saved. Item no. already exists with a different name.']);
+            echo json_encode(['ok' => false, 'message' => 'Nothing was saved. Item no. already exists with a different shoe name.']);
             exit;
         }
 
         // Notify cashiers: one notification per upload
         $lines = [];
         foreach (array_slice($saved, 0, 10) as $r) {
-            $lines[] = '1 × ' . $r['name'] . ' (' . $r['color'] . ', size ' . $r['size'] . ') [item ' . $r['sku'] . ']';
+            $lines[] = $r['qty'] . ' × ' . $r['name'] . ' (' . $r['color'] . ', size ' . $r['size'] . ', $' . number_format((float)$r['price'], 2) . ') [item ' . $r['sku'] . ']';
         }
         if (count($saved) > 10) {
             $lines[] = '…and ' . (count($saved) - 10) . ' more';
@@ -361,7 +630,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $pdo->prepare(
             'INSERT INTO stock_notifications (uploaded_by, uploaded_by_name, pairs, summary)
              VALUES (?, ?, ?, ?)'
-        )->execute([$uploaderIdOrNull, $uploaderName, count($saved), implode("\n", $lines)]);
+        )->execute([$uploaderIdOrNull, $uploaderName, array_sum(array_column($saved, 'qty')), implode("\n", $lines)]);
 
         $pdo->commit();
         log_activity($pdo, $user, 'Stock upload', implode('; ', $lines));
@@ -439,6 +708,7 @@ main{padding:28px clamp(16px,3vw,40px) 48px;min-width:0}
 .btn.primary{background:var(--strong);border-color:var(--strong);color:#fff}
 .btn.primary:hover{filter:brightness(1.1)}
 .btn.ghost{background:transparent;border-color:var(--orange);color:var(--strong)}
+.btn:disabled{opacity:.45;cursor:not-allowed}
 .kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:18px}
 .kpi{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:16px 18px}
 .kpi.hero{background:var(--orange);border-color:var(--orange)}
@@ -471,6 +741,9 @@ tr:last-child td{border-bottom:0}
 .f label{display:flex;flex-direction:column;gap:4px;font-size:14px;font-weight:600}
 .drop{border:2px dashed var(--orange);background:var(--tint);border-radius:14px;padding:20px;display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between}
 .drop p{margin:0}
+.inv-pager{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;margin-top:14px;padding-top:12px;border-top:1px solid var(--line)}
+.inv-pager .pager-btns{display:flex;gap:8px;align-items:center}
+.inv-pager .pager-pos{font-size:14px;font-weight:600;color:var(--muted);min-width:110px;text-align:center}
 .rc{display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:18px;align-items:start}
 .rlist button{display:flex;justify-content:space-between;width:100%;text-align:left;background:none;border:0;border-bottom:1px solid var(--line);padding:12px 8px;border-radius:0}
 .rlist button:hover{background:var(--bg)}
@@ -485,7 +758,6 @@ tr:last-child td{border-bottom:0}
 .toast.on{opacity:1}
 .cnt{width:84px;text-align:right}
 .neg{color:var(--bad);font-weight:700}.posv{color:var(--good);font-weight:700}
-/* Monthly comparison styles */
 .month-compare{display:flex;gap:18px;flex-wrap:wrap;margin-bottom:18px}
 .month-card{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:18px;flex:1;min-width:200px}
 .month-card .mhead{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
@@ -497,8 +769,6 @@ tr:last-child td{border-bottom:0}
 .month-bars .mb{flex:1;background:var(--tint);border-radius:6px 6px 0 0;min-width:20px;position:relative}
 .month-bars .mb.current{background:var(--orange)}
 .month-bars .mb span{position:absolute;bottom:-20px;left:50%;transform:translateX(-50%);font-size:11px;color:var(--muted);white-space:nowrap;font-weight:600}
-
-/* Stock take redesigned */
 .stocktake-hero{display:flex;flex-wrap:wrap;gap:18px;align-items:center;justify-content:space-between;margin-bottom:22px}
 .stocktake-hero .stat{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:16px 22px;flex:1;min-width:160px}
 .stocktake-hero .stat small{color:var(--muted);font-weight:500;display:block}
@@ -528,47 +798,36 @@ tr:last-child td{border-bottom:0}
 .pdf-preview table{min-width:0;font-size:13px}
 .pdf-preview th,.pdf-preview td{padding:7px 8px}
 .pdf-preview .pdf-tot{display:flex;justify-content:space-between;font-weight:700;padding:10px 0;border-top:2px solid var(--line);margin-top:8px}
-
-/* Sign out modal — centered */
 .modal{position:fixed;inset:0;background:rgba(30,15,3,.55);display:flex;align-items:center;justify-content:center;z-index:50;padding:20px}
 .modal .paper{position:static;max-width:420px;width:100%;border-top:8px solid var(--orange);padding:28px;margin:0;animation:pop .18s ease-out}
 @keyframes pop{from{transform:scale(.95);opacity:0}to{transform:scale(1);opacity:1}}
-
+.act{display:flex;gap:6px;justify-content:flex-end;flex-wrap:nowrap}
+.mini{padding:5px 11px;font-size:13px;font-weight:600;border-radius:8px;border:1px solid var(--line);background:var(--surface);white-space:nowrap}
+.mini:hover{background:var(--bg)}
+.mini.del{color:var(--bad);border-color:#F0C4C0}.mini.del:hover{background:var(--badbg)}
+.modal .paper.formp{max-width:560px;max-height:calc(100vh - 40px);overflow:auto;font-family:var(--body);font-size:15px}
+.modal .paper.pop{text-align:center;font-family:var(--body);font-size:15px}
+.modal .paper.pop.bad{border-top-color:var(--bad)}
+.modal .paper.pop.ok{border-top-color:var(--good)}
+.pop h3{font-size:22px}
+.pop p{margin:8px 0 20px;color:var(--muted);overflow-wrap:anywhere}
+.pop .btn{min-width:120px}
 @media(max-width:980px){.kpis{grid-template-columns:repeat(2,1fr)}.grid,.rc{grid-template-columns:1fr}.paper{position:static}.month-compare{flex-direction:column}}
 @media(max-width:760px){.app{grid-template-columns:1fr}.side{position:sticky;height:auto;flex-direction:row;align-items:center;padding:10px 14px;gap:10px;z-index:5;overflow-x:auto}.brand span,nav a span,.who{display:none}.signout{margin-top:0;padding:9px 10px}.signout span{display:none}nav{flex-direction:row}nav a{padding:10px}}
 @media(max-width:420px){.kpis{grid-template-columns:1fr}}
-/* Mobile responsiveness improvements — layout only */
 @media(max-width:760px){
   html,body{width:100%;max-width:100%;overflow-x:hidden}
   .app{display:block;width:100%;min-height:100vh}
-  .side{
-    position:sticky;top:0;height:auto;width:100%;
-    display:grid;grid-template-columns:minmax(0,1fr) auto;
-    align-items:center;gap:8px;padding:10px 12px;
-    overflow:visible;z-index:10;
-  }
+  .side{position:sticky;top:0;height:auto;width:100%;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:8px;padding:10px 12px;overflow:visible;z-index:10}
   .brand{font-size:21px;gap:8px;min-width:0}
   .brand span{display:inline}
   .brand svg{width:30px;height:30px;flex:none}
-  nav{
-    grid-column:1/-1;grid-row:2;
-    display:grid;grid-template-columns:repeat(3,minmax(0,1fr));
-    align-items:stretch;gap:6px;width:100%;min-width:0;
-    overflow:visible;padding:4px 0 2px;
-  }
-  nav a{
-    display:flex;min-width:0;justify-content:center;align-items:center;gap:6px;
-    padding:8px 5px;font-size:12px;white-space:nowrap;
-    border-radius:8px;background:rgba(255,255,255,.14);
-  }
+  nav{grid-column:1/-1;grid-row:2;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));align-items:stretch;gap:6px;width:100%;min-width:0;overflow:visible;padding:4px 0 2px}
+  nav a{display:flex;min-width:0;justify-content:center;align-items:center;gap:6px;padding:8px 5px;font-size:12px;white-space:nowrap;border-radius:8px;background:rgba(255,255,255,.14)}
   nav a span{display:inline;overflow:hidden;text-overflow:ellipsis}
   nav svg{width:16px;height:16px;flex:none}
   .who{display:none}
-  .signout{
-    grid-column:2;grid-row:1;
-    display:inline-flex;align-items:center;gap:7px;
-    margin:0;padding:9px 11px;white-space:nowrap;
-  }
+  .signout{grid-column:2;grid-row:1;display:inline-flex;align-items:center;gap:7px;margin:0;padding:9px 11px;white-space:nowrap}
   .signout span{display:inline}
   main{width:100%;min-width:0;padding:20px 14px 36px}
   .top{align-items:flex-start;gap:12px}
@@ -684,23 +943,58 @@ tr:last-child td{border-bottom:0}
 </section>
 
 <section class="view" id="v-upload">
-  <div class="top"><div><h1>Upload new stock</h1><p>Add shoes one entry at a time or import a CSV. Quantity is auto-set to 1 per entry.</p></div></div>
-  <div class="card"><h2>Add a shoe</h2><p class="sub">Enter the item manually. Each entry adds 1 pair to stock.</p>
+  <div class="top"><div><h1>Upload new stock</h1><p>One item no. represents a shoe type and can have multiple sizes, colors, and prices.</p></div></div>
+  <div class="card"><h2>Add a shoe variant</h2><p class="sub">Reuse the same item no. and shoe name across different sizes and prices.</p>
     <div class="f">
-      <label>Item no.<input id="n-sku" placeholder="CK-1001" autocomplete="off"></label>
-      <label>Name<input id="n-name" placeholder="Tidepool Sneaker" autocomplete="off"></label>
+      <label>Item no.<input id="n-sku" placeholder="618106" autocomplete="off" list="skuNameList"></label>
+      <label>Name (shoe type)<input id="n-name" placeholder="Tidepool Sneaker" autocomplete="off"></label>
       <label>Gender<select id="n-gender"><option>Boy</option><option>Girl</option><option>Unisex</option></select></label>
       <label>Color<select id="n-color"><option>Black</option><option>Brown</option><option>White</option></select></label>
-      <label>Size<select id="n-size"><option value="">Select size</option><option>27</option><option>28</option><option>29</option><option>30</option><option>31</option><option>32</option><option>33</option><option>34</option><option>35</option><option>36</option></select></label>
+      <label>Size<input id="n-size" placeholder="e.g. 25 / 37" autocomplete="off" list="sizePresetList"></label>
+      <label>Quantity<input id="n-qty" type="number" min="1" step="1" value="1" inputmode="numeric"></label>
       <label>Cost ($)<input id="n-cost" type="number" min="0" step="0.01" inputmode="decimal"></label>
       <label>Price ($)<input id="n-price" type="number" min="0" step="0.01" inputmode="decimal"></label>
       <button class="btn primary" id="addBtn">Add to stock</button>
     </div>
+    <datalist id="skuNameList"></datalist>
+    <datalist id="sizePresetList">
+      <option value="25">
+      <option value="26">
+      <option value="27">
+      <option value="28">
+      <option value="29">
+      <option value="30">
+      <option value="31">
+      <option value="32">
+      <option value="33">
+      <option value="34">
+      <option value="35">
+      <option value="36">
+      <option value="37">
+    </datalist>
     <p id="err" class="neg" role="alert" style="margin:10px 0 0"></p>
-    <p class="sub" style="margin:10px 0 0">Quantity is fixed at <b>1</b> per entry. Repeat the entry to add more pairs.</p>
+    <p class="sub" style="margin:10px 0 0">Enter the quantity to add for this specific item no. + color + size variant with its own cost and price.</p>
   </div>
-  <div class="card"><div class="drop"><p><b>Import from CSV</b><br>Columns: item no, name, gender, color, size, cost, price (first row is the header). Quantity is set to 1 per row.</p><input type="file" id="csv" accept=".csv,text/csv" aria-label="Choose CSV file"></div></div>
-  <div class="card"><h2>Current stock</h2><p class="sub" id="invsum"></p><div class="tw"><table><thead><tr><th>Item no.</th><th>Shoe</th><th>Gender</th><th>Color</th><th>Size</th><th class="r">Cost</th><th class="r">Price</th><th class="r">In stock</th><th>Uploaded by</th></tr></thead><tbody id="inv"></tbody></table></div></div>
+  <div class="card"><div class="drop"><p><b>Import from CSV</b><br>Columns: item no, name, gender, color, size, cost, price, quantity (optional, defaults to 1; first row is the header). Multiple rows can share the same item no. with different sizes and prices.</p><input type="file" id="csv" accept=".csv,text/csv" aria-label="Choose CSV file"></div></div>
+  <div class="card"><h2>Current stock</h2><p class="sub" id="invsum"></p>
+    <div class="tools">
+      <input type="search" id="iq" placeholder="Search item no., shoe, color or size" aria-label="Search current stock">
+      <select id="if-sku" aria-label="Filter by item no."><option value="">All item nos.</option></select>
+      <select id="if-gender" aria-label="Filter by gender"><option value="">All genders</option><option>Boy</option><option>Girl</option><option>Unisex</option></select>
+      <select id="if-color" aria-label="Filter by color"><option value="">All colors</option></select>
+      <select id="if-status" aria-label="Filter by stock status"><option value="">All stock levels</option><option value="in">In stock (&gt;5)</option><option value="low">Low stock (1–5)</option><option value="out">Out of stock (0)</option></select>
+      <button class="btn" id="invClearFilterBtn" type="button">Reset</button>
+    </div>
+    <div class="tw"><table><thead><tr><th>Item no.</th><th>Shoe</th><th>Gender</th><th>Color</th><th>Size</th><th class="r">Cost</th><th class="r">Price</th><th class="r">In stock</th><th>Uploaded by</th><th class="r">Actions</th></tr></thead><tbody id="inv"></tbody></table></div>
+    <div class="inv-pager" id="invPager">
+      <span class="sub" id="invPageInfo" style="margin:0"></span>
+      <div class="pager-btns">
+        <button class="btn" id="invPrevBtn" type="button">Previous</button>
+        <span class="pager-pos" id="invPagePos">Page 0 of 0</span>
+        <button class="btn" id="invNextBtn" type="button">Next</button>
+      </div>
+    </div>
+  </div>
 </section>
 
 <section class="view" id="v-stocktake">
@@ -723,12 +1017,12 @@ tr:last-child td{border-bottom:0}
 
   <div class="card">
     <div class="tools">
-      <input type="search" id="tq" placeholder="Search shoe, item no. or size" aria-label="Search stock">
+      <input type="search" id="tq" placeholder="Search shoe, item no., color or size" aria-label="Search stock">
       <button class="btn" id="clearTakeBtn" type="button">Clear counts</button>
     </div>
     <div class="tw">
       <table class="stocktake-table">
-        <thead><tr><th>Item no.</th><th>Shoe</th><th>Size</th><th class="r">System</th><th class="r">Counted</th><th class="r">Difference</th></tr></thead>
+        <thead><tr><th>Item no.</th><th>Shoe</th><th>Color</th><th>Size</th><th class="r">Price</th><th class="r">System</th><th class="r">Counted</th><th class="r">Difference</th></tr></thead>
         <tbody id="ttbody"></tbody>
       </table>
     </div>
@@ -752,14 +1046,46 @@ tr:last-child td{border-bottom:0}
 
 <script>
 /* ---------- Data ---------- */
-var stock=[],nextSku=1;
-function addStock(sku,n,s,q,c,p,g,col,by){
-  var f=stock.find(function(x){return x.sku.toLowerCase()===sku.toLowerCase()});
-  if(f){f.qty+=q;f.cost=c;f.price=p;f.gender=g;f.color=col;if(by)f.by=by;return f}
-  f={sku:sku,name:n,size:s,qty:q,cost:c,price:p,gender:g||'Unisex',color:col||'Black',by:by||''};
-  stock.push(f);return f;
+var stock=[];
+function variantKey(sku,col,size){
+  return String(sku||'').trim().toLowerCase()+'|'+String(col||'').trim().toLowerCase()+'|'+String(size||'').trim().toLowerCase();
 }
-
+function shoeNameForSku(sku){
+  var k=String(sku||'').trim().toLowerCase();
+  if(!k)return'';
+  var m=stock.find(function(x){return x.sku.trim().toLowerCase()===k});
+  return m?m.name:'';
+}
+function addStock(sku,n,s,q,c,p,g,col,by,id){
+  var skuClean=String(sku||'').trim();
+  var colClean=String(col||'Black').trim()||'Black';
+  var sizeClean=String(s||'').trim();
+  var key=variantKey(skuClean,colClean,sizeClean);
+  var f=stock.find(function(x){return variantKey(x.sku,x.color,x.size)===key});
+  if(f){
+    f.qty+=q;
+    if(typeof c==='number'&&!isNaN(c))f.cost=c;
+    if(typeof p==='number'&&!isNaN(p))f.price=p;
+    if(g)f.gender=g;
+    if(by)f.by=by;
+    if(id)f.id=id;
+    return f;
+  }
+  f={
+    id:id||0,
+    sku:skuClean,
+    name:String(n||'').trim(),
+    size:sizeClean,
+    qty:q,
+    cost:typeof c==='number'&&!isNaN(c)?c:0,
+    price:typeof p==='number'&&!isNaN(p)?p:0,
+    gender:g||'Unisex',
+    color:colClean,
+    by:by||''
+  };
+  stock.push(f);
+  return f;
+}
 
 var sales=[];
 
@@ -770,8 +1096,8 @@ var todaySales=[],hist=[0,0,0,0,0,0],months=[],selRc=null,lastSync='';
 function applyLive(d){
   if(!d)return;
   stock.length=0;
-  (d.stock||[]).forEach(function(r){addStock(r.sku,r.name,r.size,r.qty,r.cost,r.price,r.gender,r.color,r.by)});
-  sales=(d.sales||[]).slice().reverse();            // oldest first, the screens reverse it
+  (d.stock||[]).forEach(function(r){addStock(r.sku,r.name,r.size,r.qty,r.cost,r.price,r.gender,r.color,r.by,r.id)});
+  sales=(d.sales||[]).slice().reverse();
   todaySales=sales.filter(function(s){return s.today});
   hist=d.hist||[0,0,0,0,0,0];
   months=d.months||[];
@@ -781,11 +1107,46 @@ function applyLive(d){
 applyLive(live);
 
 var $=function(i){return document.getElementById(i)};
-function $m(n){return '$'+n.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}
+function $m(n){return '$'+Number(n||0).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}
 function esc(s){return String(s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
 function itemsText(s){return s.items.map(function(i){return esc(i.name)+' '+i.size+(i.qty>1?' ×'+i.qty:'')}).join(', ')}
-function toast(m){var t=$('toast');t.textContent=m;t.classList.add('on');clearTimeout(toast.h);toast.h=setTimeout(function(){t.classList.remove('on')},2400)}
+function toast(m){var t=$('toast');t.textContent=m;t.classList.add('on');clearTimeout(toast.h);toast.h=setTimeout(function(){t.classList.remove('on')},2600)}
 function pillFor(q){return q===0?'<span class="pill out">Out</span>':q<=5?'<span class="pill low">'+q+' left</span>':'<span class="pill">'+q+'</span>'}
+
+/* ---------- Modals ---------- */
+function openModal(id,html,onClose){
+  var old=document.getElementById(id);if(old&&old.__close)old.__close(true);
+  var m=document.createElement('div');
+  m.id=id;m.className='modal';m.setAttribute('role','dialog');m.setAttribute('aria-modal','true');
+  m.innerHTML=html;document.body.appendChild(m);
+  var done=false;
+  function onKey(e){
+    if(e.key!=='Escape')return;
+    var all=document.querySelectorAll('.modal');
+    if(all[all.length-1]===m)close();
+  }
+  function close(silent){
+    if(done)return;done=true;
+    document.removeEventListener('keydown',onKey);
+    if(m.parentNode)m.parentNode.removeChild(m);
+    if(silent!==true&&typeof onClose==='function')onClose();
+  }
+  m.__close=close;
+  m.addEventListener('click',function(e){if(e.target===m)close()});
+  document.addEventListener('keydown',onKey);
+  return m;
+}
+function postJSON(payload){
+  return fetch(location.href.split('#')[0],{
+    method:'POST',credentials:'same-origin',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(payload)
+  }).then(function(r){
+    return r.json().catch(function(){return {ok:false,message:'Unexpected response from the server.'}});
+  }).catch(function(){
+    return {ok:false,message:'Could not reach the server. Check your connection and try again.'};
+  });
+}
 
 /* ---------- Nav ---------- */
 var views=[['dashboard','Sales monitor','<rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/>'],['sales','Sales','<path d="M6 6h15l-2 9H8L6 3H3M9 20h.01M18 20h.01"/>'],['receipts','Receipts','<path d="M5 3h14v18l-3-2-2 2-2-2-2 2-2-2-3 2zM9 8h6M9 12h6"/>'],['upload','Upload stock','<path d="M12 16V4M7 9l5-5 5 5M4 20h16"/>'],['stocktake','Stock take','<path d="M9 4h6v3H9zM6 5H5v16h14V5h-1M9 14l2 2 4-4"/>']];
@@ -852,7 +1213,7 @@ function drawDash(){
     '<div class="month-card" style="display:flex;flex-direction:column;justify-content:center"><div style="font-size:15px;color:var(--muted)">Growth</div><div class="mvalue" style="font-size:36px;color:'+(delta>=0?'var(--good)':'var(--bad)')+'">'+deltaSign+deltaPct+'%</div><div style="font-size:14px;color:var(--muted)">Month-over-month change</div></div>';
 
   var low=stock.filter(function(s){return s.qty<=5}).sort(function(a,b){return a.qty-b.qty});
-  $('alerts').innerHTML=low.length?'<table style="min-width:0"><tbody>'+low.map(function(s){return '<tr><td>'+esc(s.name)+'<br><small style="color:var(--muted)">Size '+s.size+'</small></td><td class="r">'+pillFor(s.qty)+'</td></tr>'}).join('')+'</tbody></table>':'<p class="sub">Everything is stocked.</p>';
+  $('alerts').innerHTML=low.length?'<table style="min-width:0"><tbody>'+low.map(function(s){return '<tr><td>'+esc(s.name)+' ('+esc(s.sku)+')<br><small style="color:var(--muted)">'+esc(s.color)+' · Size '+esc(s.size)+' · '+$m(s.price)+'</small></td><td class="r">'+pillFor(s.qty)+'</td></tr>'}).join('')+'</tbody></table>':'<p class="sub">Everything is stocked.</p>';
 }
 
 /* ---------- Sales ---------- */
@@ -869,10 +1230,126 @@ function drawReceipts(){
   if(!s){$('paper').innerHTML='<h3>crabkidz</h3><div class="c">No receipts yet</div>';return}
   $('paper').innerHTML='<h3>crabkidz</h3><div class="c">Shoes for little feet<br>Receipt #'+s.id+' · '+s.time+'</div><hr>'+s.items.map(function(i){return '<div class="row"><span>'+esc(i.name)+'<br>Size '+i.size+' × '+i.qty+'</span><span>'+$m(i.qty*i.price)+'</span></div>'}).join('')+'<hr><div class="row tot"><span>Total</span><span>'+$m(s.total)+'</span></div><div class="row"><span>Paid by</span><span>'+s.pay+'</span></div><div class="row"><span>Served by</span><span>'+s.cashier+'</span></div><hr><div class="c">Thank you for shopping at Crabkidz!</div>'}
 
-/* ---------- Inventory (Upload stock) ---------- */
+/* ---------- Inventory (Upload stock — 10 per page + filters) ---------- */
+var INV_PAGE_SIZE=10;
+var invPage=0;
+
+function syncSkuSuggestions(){
+  var seen={};
+  var opts=[];
+  stock.forEach(function(s){
+    var k=s.sku.trim().toLowerCase();
+    if(!k||seen[k])return;
+    seen[k]=true;
+    opts.push('<option value="'+esc(s.sku)+'">'+esc(s.name)+'</option>');
+  });
+  $('skuNameList').innerHTML=opts.join('');
+}
+
+function syncInventoryFilters(){
+  var skuSel=$('if-sku');
+  var curSku=skuSel.value;
+  var seenSku={};
+  var skuOpts=['<option value="">All item nos.</option>'];
+  stock.forEach(function(s){
+    var k=s.sku.trim().toLowerCase();
+    if(!k||seenSku[k])return;
+    seenSku[k]=true;
+    skuOpts.push('<option value="'+esc(k)+'">'+esc(s.sku)+' — '+esc(s.name)+'</option>');
+  });
+  skuSel.innerHTML=skuOpts.join('');
+  if(curSku && seenSku[curSku])skuSel.value=curSku;
+
+  var colSel=$('if-color');
+  var curCol=colSel.value;
+  var seenCol={};
+  var colOpts=['<option value="">All colors</option>'];
+  stock.forEach(function(s){
+    var c=s.color.trim().toLowerCase();
+    if(!c||seenCol[c])return;
+    seenCol[c]=true;
+    colOpts.push('<option value="'+esc(c)+'">'+esc(s.color)+'</option>');
+  });
+  colSel.innerHTML=colOpts.join('');
+  if(curCol && seenCol[curCol])colSel.value=curCol;
+}
+
+function getFilteredInventory(){
+  var q=$('iq').value.trim().toLowerCase();
+  var fSku=$('if-sku').value;
+  var fGender=$('if-gender').value;
+  var fColor=$('if-color').value;
+  var fStatus=$('if-status').value;
+  return stock.filter(function(s){
+    if(fSku && s.sku.trim().toLowerCase()!==fSku)return false;
+    if(fGender && s.gender!==fGender)return false;
+    if(fColor && s.color.trim().toLowerCase()!==fColor)return false;
+    if(fStatus==='in' && s.qty<=5)return false;
+    if(fStatus==='low' && (s.qty<1 || s.qty>5))return false;
+    if(fStatus==='out' && s.qty!==0)return false;
+    if(q && (s.sku+' '+s.name+' '+s.gender+' '+s.color+' '+s.size+' '+(s.by||'')).toLowerCase().indexOf(q)===-1)return false;
+    return true;
+  });
+}
+
+$('n-sku').addEventListener('input',function(){
+  var existingName=shoeNameForSku($('n-sku').value);
+  if(existingName && !$('n-name').value.trim()){
+    $('n-name').value=existingName;
+  }
+});
+
 function drawInventory(){
-  $('inv').innerHTML=stock.map(function(s){return '<tr><td>'+esc(s.sku)+'</td><td>'+esc(s.name)+'</td><td>'+esc(s.gender)+'</td><td>'+esc(s.color)+'</td><td>'+esc(s.size)+'</td><td class="r">'+$m(s.cost)+'</td><td class="r">'+$m(s.price)+'</td><td class="r">'+pillFor(s.qty)+'</td><td>'+esc(s.by||'—')+'</td></tr>'}).join('');
-  $('invsum').textContent=stock.length+' lines, '+stock.reduce(function(t,s){return t+s.qty},0)+' pairs, '+$m(stock.reduce(function(t,s){return t+s.qty*s.cost},0))+' at cost'}
+  syncSkuSuggestions();
+  syncInventoryFilters();
+  var filtered=getFilteredInventory();
+  var uniqueSkus={};
+  stock.forEach(function(s){uniqueSkus[s.sku.trim().toLowerCase()]=true});
+  $('invsum').textContent=stock.length+' size/price variants across '+Object.keys(uniqueSkus).length+' item no.(s), '+stock.reduce(function(t,s){return t+s.qty},0)+' pairs, '+$m(stock.reduce(function(t,s){return t+s.qty*s.cost},0))+' at cost';
+
+  if(!filtered.length){
+    invPage=0;
+    $('inv').innerHTML='<tr><td colspan="10">No stock items match the current filter.</td></tr>';
+    $('invPageInfo').textContent='Showing 0 of '+stock.length+' variants';
+    $('invPagePos').textContent='Page 0 of 0';
+    $('invPrevBtn').disabled=true;
+    $('invNextBtn').disabled=true;
+    return;
+  }
+
+  var totalPages=Math.ceil(filtered.length/INV_PAGE_SIZE);
+  if(invPage>=totalPages)invPage=totalPages-1;
+  if(invPage<0)invPage=0;
+
+  var start=invPage*INV_PAGE_SIZE;
+  var pageRows=filtered.slice(start, start+INV_PAGE_SIZE);
+  $('inv').innerHTML=pageRows.map(function(s){return '<tr><td>'+esc(s.sku)+'</td><td>'+esc(s.name)+'</td><td>'+esc(s.gender)+'</td><td>'+esc(s.color)+'</td><td>'+esc(s.size)+'</td><td class="r">'+$m(s.cost)+'</td><td class="r">'+$m(s.price)+'</td><td class="r">'+pillFor(s.qty)+'</td><td>'+esc(s.by||'—')+'</td><td class="r"><div class="act"><button class="mini" type="button" data-edit="'+s.id+'" aria-label="Edit '+esc(s.name)+' '+esc(s.color)+' size '+esc(s.size)+'">Edit</button><button class="mini del" type="button" data-del="'+s.id+'" aria-label="Delete '+esc(s.name)+' '+esc(s.color)+' size '+esc(s.size)+'">Delete</button></div></td></tr>'}).join('');
+  $('invPageInfo').textContent='Showing '+(start+1)+'–'+(start+pageRows.length)+' of '+filtered.length+' matching ('+stock.length+' total)';
+  $('invPagePos').textContent='Page '+(invPage+1)+' of '+totalPages;
+  $('invPrevBtn').disabled=invPage<=0;
+  $('invNextBtn').disabled=invPage>=totalPages-1;
+}
+
+$('invPrevBtn').addEventListener('click',function(){
+  if(invPage>0){invPage--;drawInventory();}
+});
+$('invNextBtn').addEventListener('click',function(){
+  var totalPages=Math.ceil(getFilteredInventory().length/INV_PAGE_SIZE);
+  if(invPage<totalPages-1){invPage++;drawInventory();}
+});
+['iq','if-sku','if-gender','if-color','if-status'].forEach(function(id){
+  var ev=(id==='iq')?'input':'change';
+  $(id).addEventListener(ev,function(){invPage=0;drawInventory();});
+});
+$('invClearFilterBtn').addEventListener('click',function(){
+  $('iq').value='';
+  $('if-sku').value='';
+  $('if-gender').value='';
+  $('if-color').value='';
+  $('if-status').value='';
+  invPage=0;
+  drawInventory();
+});
 
 /* Save rows to the database. Uploader is picked on the server from the signed-in user. */
 function saveStock(items){
@@ -894,31 +1371,37 @@ $('addBtn').addEventListener('click',function(){
   var n=$('n-name').value.trim();
   var g=$('n-gender').value;
   var col=$('n-color').value;
-  var s=$('n-size').value;
+  var s=$('n-size').value.trim();
+  var q=parseInt($('n-qty').value,10);
   var c=parseFloat($('n-cost').value);
   var p=parseFloat($('n-price').value);
-  if(!sku||!n||!s||isNaN(c)||isNaN(p)){
-    $('err').textContent='Fill in item no., name, size, cost and price.';
+  if(!sku||!n||!s||isNaN(q)||q<1||isNaN(c)||isNaN(p)){
+    $('err').textContent='Fill in item no., name, size, quantity (at least 1), cost and price.';
     return;
   }
-  
-  var existing=stock.find(function(x){return x.sku.toLowerCase()===sku.toLowerCase()});
-  if(existing && existing.name.toLowerCase()!==n.toLowerCase()){
-    $('err').textContent='Item no. '+sku+' already exists with a different name. Please use the exact same name for variants.';
+
+  var existingName=shoeNameForSku(sku);
+  if(existingName && existingName.toLowerCase()!==n.toLowerCase()){
+    $('err').textContent='Item no. '+sku+' represents shoe type "'+existingName+'". Use the same name for different sizes or prices.';
     return;
   }
-  
+
   $('err').textContent='';
   btn.disabled=true;
-  saveStock([{sku:sku,name:n,size:s,gender:g,color:col,cost:c,price:p}]).then(function(res){
+  saveStock([{sku:sku,name:n,size:s,gender:g,color:col,cost:c,price:p,qty:q}]).then(function(res){
     btn.disabled=false;
     if(res && res.ok && res.saved && res.saved.length){
       var r=res.saved[0];
-      addStock(r.sku,r.name,r.size,1,r.cost,r.price,r.gender,r.color,r.by); // quantity always 1
-      ['n-sku','n-name','n-cost','n-price'].forEach(function(i){$(i).value=''});
-      $('n-size').value='';
+      addStock(r.sku,r.name,r.size,r.qty||q,r.cost,r.price,r.gender,r.color,r.by,r.id);
+      // Keep item no. and name so admin can quickly add another size & price for the same shoe type
+      ['n-size','n-cost','n-price'].forEach(function(i){$(i).value=''});
+      $('n-qty').value='1';
+      $('n-size').focus();
+      var filtered=getFilteredInventory();
+      var addedIdx=filtered.findIndex(function(x){return variantKey(x.sku,x.color,x.size)===variantKey(r.sku,r.color,r.size)});
+      if(addedIdx>=0)invPage=Math.floor(addedIdx/INV_PAGE_SIZE);
       drawInventory();
-      toast('✓ Stock saved: 1 × '+n+' ('+col+', size '+s+') [item '+sku+'] — uploaded by '+(r.by||'you'));
+      toast('✓ Saved: '+(r.qty||q)+' × '+r.name+' ('+r.color+', size '+r.size+', '+$m(r.price)+') [item '+r.sku+']');
     } else {
       var msg=(res&&res.message)?res.message:'Could not save the stock.';
       $('err').textContent=msg;
@@ -931,15 +1414,18 @@ $('csv').addEventListener('change',function(e){
   var input=e.target;
   var f=input.files[0];if(!f)return;var r=new FileReader();
   r.onload=function(){
-    var items=[],bad=0;
+    var items=[],bad=0,batchNames={};
+    stock.forEach(function(x){batchNames[x.sku.trim().toLowerCase()]=x.name.trim().toLowerCase()});
     r.result.split(/\r?\n/).slice(1).forEach(function(l){
       if(!l.trim())return;
       var c=l.split(',').map(function(x){return x.trim()});
       var sku=c[0],name=c[1],gender=c[2]||'Unisex',color=c[3]||'Black',size=c[4],cost=parseFloat(c[5]),price=parseFloat(c[6]);
-      if(sku&&name&&size&&!isNaN(cost)&&!isNaN(price)){
-        var ex=stock.find(function(x){return x.sku.toLowerCase()===sku.toLowerCase()});
-        if(ex && (ex.name.toLowerCase()!==name.toLowerCase())){bad++;return}
-        items.push({sku:sku,name:name,size:size,gender:gender,color:color,cost:cost,price:price});
+      var qty=(c[7]!==undefined && c[7]!=='')?parseInt(c[7],10):1;
+      if(sku&&name&&size&&!isNaN(cost)&&!isNaN(price)&&!isNaN(qty)&&qty>=1){
+        var k=sku.toLowerCase();
+        if(batchNames[k] && batchNames[k]!==name.toLowerCase()){bad++;return}
+        batchNames[k]=name.toLowerCase();
+        items.push({sku:sku,name:name,size:size,gender:gender,color:color,cost:cost,price:price,qty:qty});
       } else bad++;
     });
     input.value='';
@@ -949,7 +1435,7 @@ $('csv').addEventListener('change',function(e){
     }
     saveStock(items).then(function(res){
       if(res && res.ok && res.saved){
-        res.saved.forEach(function(x){addStock(x.sku,x.name,x.size,1,x.cost,x.price,x.gender,x.color,x.by)});
+        res.saved.forEach(function(x){addStock(x.sku,x.name,x.size,x.qty||1,x.cost,x.price,x.gender,x.color,x.by,x.id)});
         drawInventory();
         var skipped=bad+(res.skipped||0);
         toast('✓ '+res.saved.length+' rows saved'+(skipped?', '+skipped+' skipped':'')+' — uploaded by '+(res.uploadedBy||'you'));
@@ -961,10 +1447,105 @@ $('csv').addEventListener('change',function(e){
   r.readAsText(f);
 });
 
+/* ---------- Edit / delete a stock line ---------- */
+function findStockById(id){return stock.find(function(x){return x.id===id})}
+
+function openEditStock(id){
+  var s=findStockById(id);
+  if(!s){toast('That stock line could not be found. Refresh and try again.');return}
+  var m=openModal('editModal',
+    '<div class="paper formp"><h3 style="margin-bottom:4px;text-align:left">Edit stock</h3>'+
+    '<p class="sub" style="margin:0 0 14px">Item no. <b>'+esc(s.sku)+'</b>. Renaming the shoe applies to every size and color under this item no.</p>'+
+    '<div class="f">'+
+      '<label>Name (shoe type)<input id="e-name" value="'+esc(s.name)+'" autocomplete="off"></label>'+
+      '<label>Gender<select id="e-gender"><option>Boy</option><option>Girl</option><option>Unisex</option></select></label>'+
+      '<label>Color<input id="e-color" value="'+esc(s.color)+'" list="e-colors" autocomplete="off"><datalist id="e-colors"><option value="Black"><option value="Brown"><option value="White"></datalist></label>'+
+      '<label>Size<input id="e-size" value="'+esc(s.size)+'" autocomplete="off" list="sizePresetList"></label>'+
+      '<label>In stock<input id="e-qty" type="number" min="0" step="1" value="'+s.qty+'" inputmode="numeric"></label>'+
+      '<label>Cost ($)<input id="e-cost" type="number" min="0" step="0.01" value="'+s.cost+'" inputmode="decimal"></label>'+
+      '<label>Price ($)<input id="e-price" type="number" min="0" step="0.01" value="'+s.price+'" inputmode="decimal"></label>'+
+    '</div>'+
+    '<p id="e-err" class="neg" role="alert" style="margin:10px 0 0"></p>'+
+    '<div style="display:flex;gap:10px;margin-top:16px"><button class="btn" id="e-cancel" type="button" style="flex:1">Cancel</button><button class="btn primary" id="e-save" type="button" style="flex:1">Save changes</button></div></div>');
+  m.querySelector('#e-gender').value=s.gender||'Unisex';
+  m.querySelector('#e-cancel').addEventListener('click',function(){m.__close()});
+  m.querySelector('#e-name').focus();
+  m.querySelector('#e-save').addEventListener('click',function(){
+    var btn=m.querySelector('#e-save');
+    var name=m.querySelector('#e-name').value.trim();
+    var gender=m.querySelector('#e-gender').value;
+    var color=m.querySelector('#e-color').value.trim()||'Black';
+    var size=m.querySelector('#e-size').value.trim();
+    var qty=parseInt(m.querySelector('#e-qty').value,10);
+    var cost=parseFloat(m.querySelector('#e-cost').value);
+    var price=parseFloat(m.querySelector('#e-price').value);
+    var err=m.querySelector('#e-err');
+    if(!name||!size||isNaN(qty)||qty<0||isNaN(cost)||cost<0||isNaN(price)||price<0){
+      err.textContent='Fill in name, size, stock (0 or more), cost and price.';
+      return;
+    }
+    var clash=stock.some(function(x){return x.id!==s.id&&variantKey(x.sku,x.color,x.size)===variantKey(s.sku,color,size)});
+    if(clash){err.textContent='Item no. '+s.sku+' already has a '+color+' line in size '+size+'.';return}
+    err.textContent='';
+    btn.disabled=true;
+    postJSON({action:'edit_stock',id:s.id,name:name,gender:gender,color:color,size:size,qty:qty,cost:cost,price:price}).then(function(res){
+      btn.disabled=false;
+      if(res&&res.ok){
+        var skuKey=s.sku.trim().toLowerCase();
+        stock.forEach(function(x){if(x.sku.trim().toLowerCase()===skuKey)x.name=name});
+        s.gender=gender;s.color=color;s.size=size;s.qty=qty;s.cost=cost;s.price=price;
+        m.__close(true);
+        drawInventory();
+        toast('✓ Stock updated: '+qty+' × '+name+' ('+color+', size '+size+', '+$m(price)+') [item '+s.sku+'] saved successfully.');
+      } else {
+        toast('✕ Stock not updated. '+(res&&res.message)?res.message:'Could not save the changes.');
+      }
+    });
+  });
+}
+
+function confirmDeleteStock(id){
+  var s=findStockById(id);
+  if(!s){toast('That stock line could not be found. Refresh and try again.');return}
+  var m=openModal('delModal',
+    '<div class="paper pop bad"><h3>Delete this stock line?</h3>'+
+    '<p><b>'+esc(s.name)+'</b> ('+esc(s.color)+', size '+esc(s.size)+', item '+esc(s.sku)+') with '+s.qty+' in stock will be removed from the stock list. This can’t be undone.</p>'+
+    '<div style="display:flex;gap:10px"><button class="btn" id="d-no" type="button" style="flex:1">No, keep it</button><button class="btn primary" id="d-yes" type="button" style="flex:1;background:var(--bad);border-color:var(--bad)">Yes, delete</button></div></div>');
+  m.querySelector('#d-no').addEventListener('click',function(){m.__close()});
+  m.querySelector('#d-no').focus();
+  m.querySelector('#d-yes').addEventListener('click',function(){
+    var btn=m.querySelector('#d-yes');btn.disabled=true;
+    postJSON({action:'delete_stock',id:s.id}).then(function(res){
+      if(res&&res.ok){
+        var i=stock.indexOf(s);if(i>-1)stock.splice(i,1);
+        delete counts[lineKey(s)];
+        m.__close(true);
+        drawInventory();
+        toast('✓ Stock deleted: '+s.name+' ('+s.color+', size '+s.size+') was removed.');
+      } else {
+        btn.disabled=false;
+        m.__close(true);
+        toast('✕ Stock not deleted. '+(res&&res.message)?res.message:'Could not delete the stock line.');
+      }
+    });
+  });
+}
+
+$('inv').addEventListener('click',function(e){
+  var b=e.target.closest('button[data-edit],button[data-del]');
+  if(!b)return;
+  if(b.dataset.edit)openEditStock(parseInt(b.dataset.edit,10));
+  else confirmDeleteStock(parseInt(b.dataset.del,10));
+});
+
 /* ---------- Stock take ---------- */
 var counts={};
 var lastRunKey='crabkidz_last_stocktake';
 var reportData=null;
+
+function lineKey(s){
+  return s.id ? ('id:'+s.id) : ('vk:'+variantKey(s.sku,s.color,s.size));
+}
 
 function getLastRun(){
   try{var v=localStorage.getItem(lastRunKey);if(v)return new Date(v)}catch(e){}
@@ -1000,9 +1581,10 @@ function updateWeeklyStatus(){
 
 function drawTake(){
   var q=$('tq').value.toLowerCase();
-  var rows=stock.filter(function(s){return !q || (s.name+' '+s.sku+' '+s.size).toLowerCase().indexOf(q)>-1});
+  var rows=stock.filter(function(s){return !q || (s.name+' '+s.sku+' '+s.color+' '+s.size).toLowerCase().indexOf(q)>-1});
   $('ttbody').innerHTML=rows.map(function(s){
-    var c=counts[s.sku];
+    var lk=lineKey(s);
+    var c=counts[lk];
     var d=(c!==undefined)?(c-s.qty):null;
     var diffCell='';
     if(d!==null){
@@ -1011,7 +1593,7 @@ function drawTake(){
       diffCell='<span class="diff-pill '+cls+'">'+sign+d+'</span>';
     }
     var rowCls=(c!==undefined && c!==s.qty)?'row-changed':'';
-    return '<tr class="'+rowCls+'"><td>'+esc(s.sku)+'</td><td>'+esc(s.name)+'</td><td>'+esc(s.size)+'</td><td class="r">'+s.qty+'</td><td class="r"><input class="cnt" type="number" min="0" inputmode="numeric" data-sku="'+esc(s.sku)+'" value="'+(c!==undefined?c:'')+'" aria-label="Counted '+esc(s.name)+' size '+esc(s.size)+'"></td><td class="r">'+diffCell+'</td></tr>';
+    return '<tr class="'+rowCls+'"><td>'+esc(s.sku)+'</td><td>'+esc(s.name)+'</td><td>'+esc(s.color)+'</td><td>'+esc(s.size)+'</td><td class="r">'+$m(s.price)+'</td><td class="r">'+s.qty+'</td><td class="r"><input class="cnt" type="number" min="0" inputmode="numeric" data-lk="'+esc(lk)+'" value="'+(c!==undefined?c:'')+'" aria-label="Counted '+esc(s.name)+' '+esc(s.color)+' size '+esc(s.size)+'"></td><td class="r">'+diffCell+'</td></tr>';
   }).join('');
   updateStats();
 }
@@ -1020,7 +1602,7 @@ function updateStats(){
   var counted=Object.keys(counts).length;
   var net=0;
   Object.keys(counts).forEach(function(k){
-    var s=stock.find(function(x){return x.sku===k});
+    var s=stock.find(function(x){return lineKey(x)===k});
     if(s) net+=counts[k]-s.qty;
   });
   $('statLines').textContent=stock.length;
@@ -1033,11 +1615,11 @@ function updateStats(){
 }
 
 $('ttbody').addEventListener('input',function(e){
-  var k=e.target.dataset.sku;if(!k)return;
+  var k=e.target.dataset.lk;if(!k)return;
   var n=parseInt(e.target.value,10);
   if(isNaN(n)||n<0)delete counts[k];else counts[k]=n;
   var tr=e.target.closest('tr');
-  var s=stock.find(function(x){return x.sku===k});
+  var s=stock.find(function(x){return lineKey(x)===k});
   if(s){
     var c=counts[k];
     if(c!==undefined && c!==s.qty)tr.classList.add('row-changed');else tr.classList.remove('row-changed');
@@ -1071,7 +1653,7 @@ function logActivity(event,details){
 
 $('weeklyBtn').addEventListener('click',function(){
   var lines=stock.map(function(s){
-    return {sku:s.sku,name:s.name,size:s.size,system:s.qty,counted:s.qty,diff:0,gender:s.gender,color:s.color,cost:s.cost,price:s.price};
+    return {id:s.id||0,sku:s.sku,name:s.name,size:s.size,system:s.qty,counted:s.qty,diff:0,gender:s.gender,color:s.color,cost:s.cost,price:s.price};
   });
   var now=new Date();
   setLastRun(now);
@@ -1087,24 +1669,30 @@ $('applyBtn').addEventListener('click',function(){
   if(!keys.length){toast('Enter at least one count first');return}
   var lines=[];
   keys.forEach(function(k){
-    var s=stock.find(function(x){return x.sku===k});
+    var s=stock.find(function(x){return lineKey(x)===k});
     if(!s)return;
     var counted=counts[k];
     var diff=counted-s.qty;
-    lines.push({sku:s.sku,name:s.name,size:s.size,system:s.qty,counted:counted,diff:diff,gender:s.gender,color:s.color,cost:s.cost,price:s.price});
+    lines.push({id:s.id||0,sku:s.sku,name:s.name,size:s.size,system:s.qty,counted:counted,diff:diff,gender:s.gender,color:s.color,cost:s.cost,price:s.price});
   });
   var changedLines=lines.filter(function(l){return l.diff!==0}).length;
   var netDiff=lines.reduce(function(t,l){return t+l.diff},0);
   var btn=$('applyBtn');btn.disabled=true;
   fetch(location.href.split('#')[0],{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({action:'apply_stocktake',items:lines.map(function(l){return {sku:l.sku,counted:l.counted}}),
-      details:lines.length+' lines counted, '+changedLines+' changed, net '+(netDiff>0?'+':'')+netDiff+' pairs'})})
+    body:JSON.stringify({
+      action:'apply_stocktake',
+      items:lines.map(function(l){return {id:l.id,sku:l.sku,color:l.color,size:l.size,counted:l.counted}}),
+      details:lines.length+' lines counted, '+changedLines+' changed, net '+(netDiff>0?'+':'')+netDiff+' pairs'
+    })})
   .then(function(r){return r.json().catch(function(){return {ok:false,message:'Unexpected response from the server.'}})})
   .catch(function(){return {ok:false,message:'Could not reach the server.'}})
   .then(function(res){
     btn.disabled=false;
     if(!res||!res.ok){toast('✕ Stock take not saved. '+((res&&res.message)?res.message:'Please try again.'));return}
-    lines.forEach(function(l){var s=stock.find(function(x){return x.sku===l.sku});if(s)s.qty=l.counted});
+    lines.forEach(function(l){
+      var s=stock.find(function(x){return (l.id && x.id===l.id) || variantKey(x.sku,x.color,x.size)===variantKey(l.sku,l.color,l.size)});
+      if(s)s.qty=l.counted;
+    });
     counts={};
     drawTake();
     var now=new Date();
