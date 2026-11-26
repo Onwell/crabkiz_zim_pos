@@ -1,17 +1,7 @@
 <?php
 // cashier/index.php — Cashier dashboard
 declare(strict_types=1);
-session_start();
-
-if (empty($_SESSION['user'])) {
-    $_SESSION['flash'] = ['type' => 'error', 'text' => 'Please sign in first.'];
-    header('Location: ../index.php');
-    exit;
-}
-if ($_SESSION['user']['role'] !== 'Cashier') {
-    header('Location: ../admin/index.php');
-    exit;
-}
+require __DIR__ . '/cashier_guard.php';   // sign-in, Cashier role, idle timeout, CSRF
 
 $user      = $_SESSION['user'];
 $userName  = $user['full_name'] ?? 'Cashier';
@@ -64,39 +54,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
         $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
 
-        $ensureTable = static function (PDO $pdo): void {
-            $pdo->exec('CREATE TABLE IF NOT EXISTS sale_variants (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                receipt_no VARCHAR(40) NOT NULL,
-                item_no VARCHAR(40) NOT NULL,
-                name VARCHAR(120) NOT NULL,
-                color VARCHAR(40) NOT NULL,
-                size VARCHAR(10) NOT NULL,
-                qty INT NOT NULL,
-                price DECIMAL(10,2) NOT NULL,
-                KEY idx_receipt (receipt_no)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
-        };
-
-        $ensureRestockTable = static function (PDO $pdo): void {
-            $pdo->exec('CREATE TABLE IF NOT EXISTS restock_requests (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                item_no VARCHAR(40) NOT NULL,
-                name VARCHAR(120) NOT NULL,
-                color VARCHAR(40) NOT NULL,
-                size VARCHAR(20) NOT NULL,
-                current_qty INT NOT NULL DEFAULT 0,
-                requested_by_id INT NULL,
-                requested_by_name VARCHAR(120) NOT NULL,
-                status VARCHAR(20) NOT NULL DEFAULT \'pending\',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                KEY idx_status (status)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
-        };
+        // Tables (sale_variants, restock_requests) are created once by the database setup, not on page requests.
 
         if ($action === 'bootstrap') {
-            $ensureTable($pdo);
-
             // One item no. has one products row per size: match on item no. + size
             $prod = [];
             $prodAny = [];
@@ -168,6 +128,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 exit;
             }
             $pdo->beginTransaction();
+
+            // A reservation that was never finished (tab closed, network drop) is given back first
+            $stale = $_SESSION['pending_reserve'] ?? null;
+            if (is_array($stale) && empty($stale['sold']) && !empty($stale['items']) && is_array($stale['items'])) {
+                $back = $pdo->prepare('UPDATE stock_items SET qty = qty + ? WHERE sku = ? AND color = ? AND size = ?');
+                foreach ($stale['items'] as $r) {
+                    $back->execute([(int)$r['qty'], (string)$r['sku'], (string)$r['color'], (string)$r['size']]);
+                }
+            }
+
             $sel = $pdo->prepare('SELECT qty FROM stock_items WHERE sku = ? AND color = ? AND size = ? LIMIT 1 FOR UPDATE');
             $cnt = $pdo->prepare('SELECT COUNT(*) FROM stock_items WHERE sku = ?');
             $upd = $pdo->prepare('UPDATE stock_items SET qty = IF(qty >= ?, qty - ?, 0) WHERE sku = ? AND color = ? AND size = ?');
@@ -189,36 +159,64 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $upd->execute([$it['qty'], $it['qty'], $it['sku'], $it['color'], $it['size']]);
             }
             $pdo->commit();
+            $_SESSION['pending_reserve'] = ['items' => $items, 'sold' => false, 'at' => time()];
+            unset($_SESSION['pending_attach']);
             echo json_encode(['ok' => true]);
             exit;
         }
 
         if ($action === 'release') {
-            $items = $cleanItems(is_array($in) ? ($in['items'] ?? null) : null, false);
+            // Only stock this cashier actually reserved (and did not sell) can be released; the browser's list is ignored
+            $pend = $_SESSION['pending_reserve'] ?? null;
+            if (!is_array($pend) || !empty($pend['sold']) || empty($pend['items']) || !is_array($pend['items'])) {
+                echo json_encode(['ok' => true]);
+                exit;
+            }
             $pdo->beginTransaction();
             $add = $pdo->prepare('UPDATE stock_items SET qty = qty + ? WHERE sku = ? AND color = ? AND size = ?');
-            foreach ($items as $it) {
-                $add->execute([$it['qty'], $it['sku'], $it['color'], $it['size']]);
+            foreach ($pend['items'] as $r) {
+                $add->execute([(int)$r['qty'], (string)$r['sku'], (string)$r['color'], (string)$r['size']]);
             }
             $pdo->commit();
+            unset($_SESSION['pending_reserve']);
             echo json_encode(['ok' => true]);
             exit;
         }
 
         if ($action === 'attach') {
             $receipt = is_array($in) && isset($in['receipt_no']) && is_scalar($in['receipt_no']) ? trim((string)$in['receipt_no']) : '';
-            $items   = $cleanItems(is_array($in) ? ($in['items'] ?? null) : null, true);
-            if ($receipt === '' || mb_strlen($receipt) > 40 || !$items) {
+            $pend    = $_SESSION['pending_reserve'] ?? null;
+            if ($receipt === '' || $receipt !== (string)($_SESSION['pending_attach'] ?? '')
+                || !is_array($pend) || empty($pend['sold']) || empty($pend['items']) || !is_array($pend['items'])) {
                 echo json_encode(['ok' => false, 'error' => 'Invalid receipt details.']);
                 exit;
             }
-            $ensureTable($pdo);
+            $chk = $pdo->prepare('SELECT cashier_name FROM sales WHERE receipt_no = ? LIMIT 1');
+            $chk->execute([$receipt]);
+            $who = $chk->fetchColumn();
+            if ($who === false || (string)$who !== (string)($user['full_name'] ?? '')) {
+                echo json_encode(['ok' => false, 'error' => 'Invalid receipt details.']);
+                exit;
+            }
+            $dup = $pdo->prepare('SELECT COUNT(*) FROM sale_variants WHERE receipt_no = ?');
+            $dup->execute([$receipt]);
+            if ((int)$dup->fetchColumn() > 0) {
+                echo json_encode(['ok' => true]);
+                exit;
+            }
             $pdo->beginTransaction();
-            $ins = $pdo->prepare('INSERT INTO sale_variants (receipt_no, item_no, name, color, size, qty, price) VALUES (?, ?, ?, ?, ?, ?, ?)');
-            foreach ($items as $it) {
-                $ins->execute([$receipt, $it['sku'], $it['name'], $it['color'], $it['size'], $it['qty'], $it['price']]);
+            $look = $pdo->prepare('SELECT name, price FROM stock_items WHERE LOWER(sku) = LOWER(?) AND LOWER(color) = LOWER(?) AND LOWER(size) = LOWER(?) LIMIT 1');
+            $ins  = $pdo->prepare('INSERT INTO sale_variants (receipt_no, item_no, name, color, size, qty, price) VALUES (?, ?, ?, ?, ?, ?, ?)');
+            foreach ($pend['items'] as $r) {
+                $look->execute([(string)$r['sku'], (string)$r['color'], (string)$r['size']]);
+                $row = $look->fetch();
+                if (!$row) {
+                    continue;
+                }
+                $ins->execute([$receipt, (string)$r['sku'], mb_substr((string)$row['name'], 0, 120), (string)$r['color'], (string)$r['size'], (int)$r['qty'], round((float)$row['price'], 2)]);
             }
             $pdo->commit();
+            unset($_SESSION['pending_attach'], $_SESSION['pending_reserve']);
             echo json_encode(['ok' => true]);
             exit;
         }
@@ -235,7 +233,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 exit;
             }
 
-            $ensureRestockTable($pdo);
             $reqById = isset($user['id']) && is_numeric($user['id']) ? (int)$user['id'] : null;
             $ins = $pdo->prepare('INSERT INTO restock_requests (item_no, name, color, size, current_qty, requested_by_id, requested_by_name) VALUES (?, ?, ?, ?, ?, ?, ?)');
             $ins->execute([
@@ -268,8 +265,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 echo json_encode(['ok' => false, 'error' => 'Please fill in all password fields.']);
                 exit;
             }
-            if (mb_strlen($newPass) < 6) {
-                echo json_encode(['ok' => false, 'error' => 'New password must be at least 6 characters.']);
+            if (mb_strlen($newPass) < 8) {
+                echo json_encode(['ok' => false, 'error' => 'New password must be at least 8 characters.']);
+                exit;
+            }
+            if ($newPass === $curPass) {
+                echo json_encode(['ok' => false, 'error' => 'Choose a new password that is different from the current one.']);
+                exit;
+            }
+            $pwFail = $_SESSION['pw_fail'] ?? ['n' => 0, 'until' => 0];
+            if (time() < (int)($pwFail['until'] ?? 0)) {
+                echo json_encode(['ok' => false, 'error' => 'Too many wrong attempts. Please wait a few minutes and try again.']);
                 exit;
             }
             if ($newPass !== $cfmPass) {
@@ -299,15 +305,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
 
             $stored = (string)($row['p_val'] ?? '');
-            $valid = password_verify($curPass, $stored) || hash_equals($stored, $curPass);
+            // A stored hash is only ever checked with password_verify; plain-text fallback is for old unhashed rows only
+            $isHash = !empty(password_get_info($stored)['algo']);
+            $valid  = $isHash ? password_verify($curPass, $stored) : hash_equals($stored, $curPass);
             if (!$valid) {
+                $n = (int)($pwFail['n'] ?? 0) + 1;
+                $_SESSION['pw_fail'] = $n >= 5 ? ['n' => 0, 'until' => time() + 900] : ['n' => $n, 'until' => 0];
                 echo json_encode(['ok' => false, 'error' => 'Current password is incorrect.']);
                 exit;
             }
+            unset($_SESSION['pw_fail']);
 
             $newHash = password_hash($newPass, PASSWORD_DEFAULT);
             $upd = $pdo->prepare("UPDATE users SET `{$passCol}` = ? WHERE id = ?");
             $upd->execute([$newHash, $userId]);
+            session_regenerate_id(true);
 
             if (file_exists(__DIR__ . '/../log_activity.php')) {
                 require_once __DIR__ . '/../log_activity.php';
@@ -328,7 +340,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
         error_log('Cashier variant action failed (' . $action . '): ' . $e->getMessage());
         http_response_code(500);
-        echo json_encode(['ok' => false, 'error' => 'Database error: ' . $e->getMessage()]);
+        echo json_encode(['ok' => false, 'error' => 'Something went wrong on the server. Please try again.']);
     }
     exit;
 }
@@ -540,8 +552,8 @@ input,select{border:1px solid var(--line);background:var(--surface);border-radiu
     <p class="sub" style="margin:4px 0 8px">Update your cashier login password.</p>
     <form class="form-stack" id="pwForm">
       <label>Current password<input id="curPw" type="password" autocomplete="current-password" required></label>
-      <label>New password<input id="newPw" type="password" minlength="6" autocomplete="new-password" required></label>
-      <label>Confirm new password<input id="cfmPw" type="password" minlength="6" autocomplete="new-password" required></label>
+      <label>New password<input id="newPw" type="password" minlength="8" autocomplete="new-password" required></label>
+      <label>Confirm new password<input id="cfmPw" type="password" minlength="8" autocomplete="new-password" required></label>
       <p id="pwErr" class="neg" role="alert" style="margin:2px 0"></p>
       <div style="display:flex;gap:10px;margin-top:6px">
         <button class="btn" type="button" id="pwCancel" style="flex:1">Cancel</button>
@@ -560,9 +572,11 @@ input,select{border:1px solid var(--line);background:var(--surface);border-radiu
 <div class="toast" id="toast" role="status"></div>
 
 <script>
+var CSRF=<?= json_encode(csrf_token()) ?>;
+function jsonHeaders(extra){var h={'Content-Type':'application/json','X-CSRF-Token':CSRF};if(extra)for(var k in extra)h[k]=extra[k];return h}
 var $=function(i){return document.getElementById(i)};
 function $m(n){return '$'+(+n||0).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}
-function esc(s){return String(s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
 function toast(m){var t=$('toast');t.textContent=m;t.classList.add('on');clearTimeout(toast.h);toast.h=setTimeout(function(){t.classList.remove('on')},3200)}
 function fmtD(d){return new Date(d).toLocaleDateString(undefined,{day:'numeric',month:'short',year:'numeric'})}
 function fmtT(d){return new Date(d).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}
@@ -571,14 +585,17 @@ function pill(q){return q===0?'<span class="pill out">Out</span>':q<=5?'<span cl
 var stock=[], sales=[], hist=[0,0,0,0,0,0], todayData={sales:[],total:0,pairs:0,cash:0};
 var variants=[], recVars={}, variantsLoaded=false, notifIds=[], requestedRestock={};
 
-function postJson(body){
+function postJson(body,bg){
   return fetch(location.href.split('#')[0],{
     method:'POST',
     credentials:'same-origin',
-    headers:{'Content-Type':'application/json'},
+    headers:jsonHeaders(bg?{'X-Background-Poll':'1'}:null),
     body:JSON.stringify(body)
   }).then(function(r){
     return r.json().catch(function(){return {ok:false,error:'Invalid JSON response from server.'}});
+  }).then(function(j){
+    if(j&&j.code==='session_expired'){location.reload();}
+    return j;
   }).catch(function(){
     return {ok:false,error:'Could not reach the server.'};
   });
@@ -604,14 +621,15 @@ function mergeReceiptVariants(){
   });
 }
 
-function loadData(){
+function loadData(bg){
   return Promise.all([
-    fetch('api_get_data.php',{credentials:'same-origin'}).then(function(r){
+    fetch('api_get_data.php',{credentials:'same-origin',headers:bg?{'X-Background-Poll':'1'}:{}}).then(function(r){
       return r.json().catch(function(){return {error:'Invalid data response'}});
     }),
-    postJson({action:'bootstrap'})
+    postJson({action:'bootstrap'},bg)
   ]).then(function(res){
     var data = res[0];
+    if(data && data.code==='session_expired'){location.reload();return;}
     if(!data || data.error){
       toast('Database sync issue: '+((data&&data.error)||'Check api_get_data.php'));
       return;
@@ -665,7 +683,7 @@ function dismissNotifications(){
   fetch('api_mark_notifications_read.php',{
     method:'POST',
     credentials:'same-origin',
-    headers:{'Content-Type':'application/json'},
+    headers:jsonHeaders(),
     body:JSON.stringify({ids:ids})
   }).catch(function(err){console.error('Could not mark notifications read:',err)});
 }
@@ -890,7 +908,7 @@ $('done').addEventListener('click',function(){
     return fetch('api_save_sale.php',{
       method:'POST',
       credentials:'same-origin',
-      headers:{'Content-Type':'application/json'},
+      headers:jsonHeaders(),
       body:JSON.stringify(payload)
     }).then(function(x){
       return x.json().catch(function(){return {error:'Invalid response from api_save_sale.php'}});
@@ -966,7 +984,7 @@ $('pwForm').addEventListener('submit',function(e){
   e.preventDefault();
   $('pwErr').textContent='';
   var curP=$('curPw').value, newP=$('newPw').value, cfmP=$('cfmPw').value;
-  if(newP.length<6){$('pwErr').textContent='New password must be at least 6 characters.';return;}
+  if(newP.length<8){$('pwErr').textContent='New password must be at least 8 characters.';return;}
   if(newP!==cfmP){$('pwErr').textContent='New passwords do not match.';return;}
   $('pwSave').disabled=true;
   $('pwSave').textContent='Saving...';
@@ -1001,8 +1019,16 @@ document.addEventListener('keydown',function(e){
 });
 
 loadData();
-setInterval(loadData,15000);
-document.addEventListener('visibilitychange',function(){if(!document.hidden)loadData()});
+setInterval(function(){loadData(true)},15000);
+document.addEventListener('visibilitychange',function(){if(!document.hidden)loadData(true)});
+</script>
+<script>
+/* Blocks Ctrl+U / Cmd+U (view source). Convenience only - it is NOT a security control:
+   anyone can still use the browser menu or a view-source: address. Real protection is on the server. */
+document.addEventListener('keydown',function(e){
+  var k=(e.key||'').toLowerCase();
+  if((e.ctrlKey||e.metaKey)&&(k==='u'||e.code==='KeyU')){e.preventDefault();e.stopPropagation();return false;}
+},true);
 </script>
 </body>
 </html>

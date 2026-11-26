@@ -1,20 +1,7 @@
 <?php
 // admin/index.php — Admin dashboard
 declare(strict_types=1);
-session_start();
-
-// 1) Must be signed in
-if (empty($_SESSION['user'])) {
-    $_SESSION['flash'] = ['type' => 'error', 'text' => 'Please sign in first.'];
-    header('Location: ../index.php');
-    exit;
-}
-
-// 2) Must be an Admin
-if ($_SESSION['user']['role'] !== 'Admin') {
-    header('Location: ../cashier/index.php');
-    exit;
-}
+require __DIR__ . '/admin_guard.php';   // sign-in, Admin role, idle timeout, CSRF
 
 // Pull signed-in user details for display
 $user      = $_SESSION['user'];
@@ -50,47 +37,7 @@ function crabkidz_variant_key(string $sku, string $color, string $size): string
     return mb_strtolower(trim($sku)) . '|' . mb_strtolower(trim($color)) . '|' . mb_strtolower(trim($size));
 }
 
-function crabkidz_ensure_products_index(PDO $pdo): void
-{
-    // One item no. must be able to hold many sizes: unique on (item_no, size), not item_no alone.
-    try {
-        $idx = $pdo->query("SHOW INDEX FROM products WHERE Key_name = 'item_no'")->fetchAll();
-        if ($idx) {
-            $pdo->exec('ALTER TABLE products DROP INDEX item_no');
-            $has = $pdo->query("SHOW INDEX FROM products WHERE Key_name = 'item_size'")->fetchAll();
-            if (!$has) {
-                $pdo->exec('ALTER TABLE products ADD UNIQUE KEY item_size (item_no, size)');
-            }
-        }
-    } catch (Throwable $e) {
-        error_log('Crabkidz products index fix failed: ' . $e->getMessage());
-    }
-}
-
-function crabkidz_ensure_notification_tables(PDO $pdo): void
-{
-    $pdo->exec('CREATE TABLE IF NOT EXISTS restock_requests (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        item_no VARCHAR(40) NOT NULL,
-        name VARCHAR(120) NOT NULL,
-        color VARCHAR(40) NOT NULL,
-        size VARCHAR(20) NOT NULL,
-        current_qty INT NOT NULL DEFAULT 0,
-        requested_by_id INT NULL,
-        requested_by_name VARCHAR(120) NOT NULL,
-        status VARCHAR(20) NOT NULL DEFAULT \'pending\',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        KEY idx_status (status)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
-
-    $pdo->exec('CREATE TABLE IF NOT EXISTS admin_notification_reads (
-        user_id INT NOT NULL,
-        request_id INT NOT NULL,
-        read_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        PRIMARY KEY (user_id, request_id),
-        KEY idx_req (request_id)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
-}
+/* Schema changes (indexes / notification tables) now live in migration_admin.sql - run once, not on page requests. */
 
 /* ---------- Live data: stock + sales made by cashiers + restock notifications ---------- */
 function crabkidz_live_data(PDO $pdo, int $adminId = 0): array
@@ -222,7 +169,6 @@ function crabkidz_live_data(PDO $pdo, int $adminId = 0): array
 
     // Restock request notifications from cashiers
     try {
-        crabkidz_ensure_notification_tables($pdo);
         if ($adminId > 0) {
             $stmt = $pdo->prepare(
                 'SELECT r.id, r.item_no, r.name, r.color, r.size, r.current_qty,
@@ -317,7 +263,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
         try {
             $pdo = crabkidz_db();
-            crabkidz_ensure_notification_tables($pdo);
             $uid = crabkidz_current_admin_id($pdo, $user);
             if ($uid <= 0) {
                 crabkidz_json(['ok' => false, 'message' => 'Could not identify admin user.'], 400);
@@ -342,7 +287,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if (is_array($in) && ($in['action'] ?? '') === 'mark_all_notifications_read') {
         try {
             $pdo = crabkidz_db();
-            crabkidz_ensure_notification_tables($pdo);
             $uid = crabkidz_current_admin_id($pdo, $user);
             if ($uid <= 0) {
                 crabkidz_json(['ok' => false, 'message' => 'Could not identify admin user.'], 400);
@@ -466,7 +410,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         try {
             $pdo = crabkidz_db();
-            crabkidz_ensure_products_index($pdo);
             $pdo->beginTransaction();
 
             $sel = $pdo->prepare('SELECT id, sku, name, color, size FROM stock_items WHERE id = ? LIMIT 1');
@@ -649,8 +592,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $uploaderId = (int)($q->fetchColumn() ?: 0);
         }
         $uploaderIdOrNull = $uploaderId > 0 ? $uploaderId : null;
-
-        crabkidz_ensure_products_index($pdo);
 
         $pdo->beginTransaction();
 
@@ -1228,10 +1169,12 @@ tr.row-unread{background:rgba(242,107,15,.06)}
 <div class="toast" id="toast" role="status"></div>
 
 <script>
+var CSRF=<?= json_encode(csrf_token()) ?>;
+function jsonHeaders(extra){var h={'Content-Type':'application/json','X-CSRF-Token':CSRF};if(extra)for(var k in extra)h[k]=extra[k];return h}
 var $=function(i){return document.getElementById(i)};
 function $m(n){return '$'+Number(n||0).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}
-function esc(s){return String(s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
-function itemsText(s){return (s.items||[]).map(function(i){return esc(i.name)+' '+i.size+(i.qty>1?' ×'+i.qty:'')}).join(', ')}
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
+function itemsText(s){return (s.items||[]).map(function(i){return esc(i.name)+' '+esc(i.size)+(i.qty>1?' ×'+esc(i.qty):'')}).join(', ')}
 function toast(m){var t=$('toast');if(!t)return;t.textContent=m;t.classList.add('on');clearTimeout(toast.h);toast.h=setTimeout(function(){t.classList.remove('on')},2600)}
 function pillFor(q){return q===0?'<span class="pill out">Out</span>':q<=5?'<span class="pill low">'+q+' left</span>':'<span class="pill">'+q+'</span>'}
 function fmtNotifDate(dt){
@@ -1330,7 +1273,7 @@ function openModal(id,html,onClose){
 function postJSON(payload){
   return fetch(location.href.split('#')[0],{
     method:'POST',credentials:'same-origin',
-    headers:{'Content-Type':'application/json'},
+    headers:jsonHeaders(),
     body:JSON.stringify(payload)
   }).then(function(r){
     return r.json().catch(function(){return {ok:false,message:'Unexpected response from the server.'}});
@@ -1463,15 +1406,15 @@ function drawDash(){
 function drawSales(){
   var q=$('sq').value.toLowerCase(),p=$('sp').value;
   var rows=sales.filter(function(s){return(!p||s.pay===p)&&(!q||(s.id+' '+itemsText(s)+' '+s.cashier).toLowerCase().indexOf(q)>-1)}).slice().reverse();
-  $('stbody').innerHTML=rows.map(function(s){return '<tr><td>#'+s.id+'</td><td>'+s.time+'</td><td>'+itemsText(s)+'</td><td>'+s.cashier+'</td><td>'+s.pay+'</td><td class="r">'+$m(s.total)+'</td><td><button class="link" data-rc="'+s.id+'">View receipt</button></td></tr>'}).join('')||'<tr><td colspan="7">No sales match. Clear the search or payment filter.</td></tr>';
+  $('stbody').innerHTML=rows.map(function(s){return '<tr><td>#'+esc(s.id)+'</td><td>'+esc(s.time)+'</td><td>'+itemsText(s)+'</td><td>'+esc(s.cashier)+'</td><td>'+esc(s.pay)+'</td><td class="r">'+$m(s.total)+'</td><td><button class="link" data-rc="'+esc(s.id)+'">View receipt</button></td></tr>'}).join('')||'<tr><td colspan="7">No sales match. Clear the search or payment filter.</td></tr>';
   $('ssum').textContent=rows.length+' sales, '+$m(rows.reduce(function(t,s){return t+s.total},0))+' total'}
 $('sq').addEventListener('input',drawSales);$('sp').addEventListener('change',drawSales);
 
 function drawReceipts(){
-  $('rlist').innerHTML=sales.slice().reverse().map(function(s){return '<button data-rc="'+s.id+'" aria-pressed="'+(s.id===selRc)+'"><span><b>#'+s.id+'</b><br><small style="color:var(--muted)">'+s.time+' · '+s.pay+'</small></span><b>'+$m(s.total)+'</b></button>'}).join('');
+  $('rlist').innerHTML=sales.slice().reverse().map(function(s){return '<button data-rc="'+esc(s.id)+'" aria-pressed="'+(s.id===selRc)+'"><span><b>#'+esc(s.id)+'</b><br><small style="color:var(--muted)">'+esc(s.time)+' · '+esc(s.pay)+'</small></span><b>'+$m(s.total)+'</b></button>'}).join('');
   var s=sales.find(function(x){return x.id===selRc});
   if(!s){$('paper').innerHTML='<h3>crabkidz</h3><div class="c">No receipts yet</div>';return}
-  $('paper').innerHTML='<h3>crabkidz</h3><div class="c">Shoes for little feet<br>Receipt #'+s.id+' · '+s.time+'</div><hr>'+(s.items||[]).map(function(i){return '<div class="row"><span>'+esc(i.name)+(i.color?' ('+esc(i.color)+')':'')+'<br>Size '+i.size+' × '+i.qty+'</span><span>'+$m(i.qty*i.price)+'</span></div>'}).join('')+'<hr><div class="row tot"><span>Total</span><span>'+$m(s.total)+'</span></div><div class="row"><span>Paid by</span><span>'+s.pay+'</span></div><div class="row"><span>Served by</span><span>'+s.cashier+'</span></div><hr><div class="c">Thank you for shopping at Crabkidz!</div>'}
+  $('paper').innerHTML='<h3>crabkidz</h3><div class="c">Shoes for little feet<br>Receipt #'+esc(s.id)+' · '+esc(s.time)+'</div><hr>'+(s.items||[]).map(function(i){return '<div class="row"><span>'+esc(i.name)+(i.color?' ('+esc(i.color)+')':'')+'<br>Size '+esc(i.size)+' × '+esc(i.qty)+'</span><span>'+$m(i.qty*i.price)+'</span></div>'}).join('')+'<hr><div class="row tot"><span>Total</span><span>'+$m(s.total)+'</span></div><div class="row"><span>Paid by</span><span>'+esc(s.pay)+'</span></div><div class="row"><span>Served by</span><span>'+esc(s.cashier)+'</span></div><hr><div class="c">Thank you for shopping at Crabkidz!</div>'}
 
 /* ---------- Notifications (Read / Unread + 20 per page pagination) ---------- */
 var NOTIF_PAGE_SIZE=20;
@@ -1688,7 +1631,7 @@ function saveStock(items){
   return fetch(location.href.split('#')[0],{
     method:'POST',
     credentials:'same-origin',
-    headers:{'Content-Type':'application/json'},
+    headers:jsonHeaders(),
     body:JSON.stringify({action:'add_stock',items:items})
   }).then(function(r){
     return r.json().catch(function(){return {ok:false,message:'Unexpected response from the server.'}});
@@ -1979,7 +1922,7 @@ function autoWeeklyCheck(){
 
 function logActivity(event,details){
   try{
-    fetch(location.href.split('#')[0],{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'log_activity',event:event,details:details})}).catch(function(){});
+    fetch(location.href.split('#')[0],{method:'POST',credentials:'same-origin',headers:jsonHeaders(),body:JSON.stringify({action:'log_activity',event:event,details:details})}).catch(function(){});
   }catch(e){}
 }
 
@@ -2010,7 +1953,7 @@ $('applyBtn').addEventListener('click',function(){
   var changedLines=lines.filter(function(l){return l.diff!==0}).length;
   var netDiff=lines.reduce(function(t,l){return t+l.diff},0);
   var btn=$('applyBtn');btn.disabled=true;
-  fetch(location.href.split('#')[0],{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},
+  fetch(location.href.split('#')[0],{method:'POST',credentials:'same-origin',headers:jsonHeaders(),
     body:JSON.stringify({
       action:'apply_stocktake',
       items:lines.map(function(l){return {id:l.id,sku:l.sku,color:l.color,size:l.size,counted:l.counted}}),
@@ -2115,10 +2058,11 @@ document.getElementById('signoutBtn').addEventListener('click', function () {
 var refreshing=false;
 function refreshData(){
   if(refreshing)return;refreshing=true;
-  fetch(location.href.split('#')[0],{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'get_data'})})
+  fetch(location.href.split('#')[0],{method:'POST',credentials:'same-origin',headers:jsonHeaders({'X-Background-Poll':'1'}),body:JSON.stringify({action:'get_data'})})
   .then(function(r){return r.json()})
   .then(function(d){
     refreshing=false;
+    if(d&&d.error==='session_expired'){location.reload();return}
     if(!d||d.error)return;
     applyLive(d);
     var h=(location.hash||'#dashboard').slice(1);
@@ -2144,6 +2088,13 @@ try {
 }
 setInterval(autoWeeklyCheck, 60*1000);
 </script>
+<script>
+/* Blocks Ctrl+U / Cmd+U (view source). Convenience only - it is NOT a security control:
+   anyone can still use the browser menu or a view-source: address. Real protection is on the server. */
+document.addEventListener('keydown',function(e){
+  var k=(e.key||'').toLowerCase();
+  if((e.ctrlKey||e.metaKey)&&(k==='u'||e.code==='KeyU')){e.preventDefault();e.stopPropagation();return false;}
+},true);
+</script>
 </body>
 </html>
-```[cite: 2]

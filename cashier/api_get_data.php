@@ -1,14 +1,11 @@
 <?php
 declare(strict_types=1);
-session_start();
+define('GUARD_JSON', true);
+require __DIR__ . '/cashier_guard.php';   // sign-in, Cashier role, idle timeout
 require __DIR__ . '/../db.php';
 
 header('Content-Type: application/json');
-
-if (empty($_SESSION['user']) || $_SESSION['user']['role'] !== 'Cashier') {
-    echo json_encode(['error' => 'Unauthorized']);
-    exit;
-}
+header('Cache-Control: no-store');
 
 // Get Stock
 $stmt = $pdo->query("SELECT id, item_no, name, size, price, stock_qty, initial_qty FROM products ORDER BY id ASC");

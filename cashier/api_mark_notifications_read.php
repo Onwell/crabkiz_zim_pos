@@ -1,18 +1,15 @@
 <?php
 declare(strict_types=1);
-session_start();
+define('GUARD_JSON', true);
+require __DIR__ . '/cashier_guard.php';   // sign-in, Cashier role, idle timeout, CSRF
 require __DIR__ . '/../db.php';
 
 header('Content-Type: application/json');
-
-if (empty($_SESSION['user']) || $_SESSION['user']['role'] !== 'Cashier') {
-    echo json_encode(['error' => 'Unauthorized']);
-    exit;
-}
+header('Cache-Control: no-store');
 
 $input = json_decode((string)file_get_contents('php://input'), true);
 $ids = (is_array($input) && is_array($input['ids'] ?? null)) ? $input['ids'] : [];
-$ids = array_values(array_unique(array_filter(array_map('intval', $ids), function ($i) { return $i > 0; })));
+$ids = array_values(array_unique(array_filter(array_map('intval', array_slice($ids, 0, 100)), function ($i) { return $i > 0; })));
 
 try {
     $u = $_SESSION['user'];
@@ -27,7 +24,11 @@ try {
         exit;
     }
 
-    $stmt = $pdo->prepare("INSERT IGNORE INTO stock_notification_reads (user_id, notification_id) VALUES (?, ?)");
+    // Only marks notifications that really exist (no foreign-key errors from made-up ids)
+    $stmt = $pdo->prepare(
+        "INSERT IGNORE INTO stock_notification_reads (user_id, notification_id)
+         SELECT ?, id FROM stock_notifications WHERE id = ?"
+    );
     foreach ($ids as $id) {
         $stmt->execute([$uid, $id]);
     }

@@ -1,20 +1,7 @@
 <?php
 // admin/activity.php — System activity log
 declare(strict_types=1);
-session_start();
-
-// 1) Must be signed in
-if (empty($_SESSION['user'])) {
-    $_SESSION['flash'] = ['type' => 'error', 'text' => 'Please sign in first.'];
-    header('Location: ../index.php');
-    exit;
-}
-
-// 2) Must be an Admin
-if ($_SESSION['user']['role'] !== 'Admin') {
-    header('Location: ../cashier/index.php');
-    exit;
-}
+require __DIR__ . '/admin_guard.php';
 
 require __DIR__ . '/../db.php';   // provides $pdo
 
@@ -361,6 +348,14 @@ document.getElementById('signoutBtn').addEventListener('click', function () {
 });
 
 
+</script>
+<script>
+/* Blocks Ctrl+U / Cmd+U (view source). Convenience only - it is NOT a security control:
+   anyone can still use the browser menu or a view-source: address. Real protection is on the server. */
+document.addEventListener('keydown',function(e){
+  var k=(e.key||'').toLowerCase();
+  if((e.ctrlKey||e.metaKey)&&(k==='u'||e.code==='KeyU')){e.preventDefault();e.stopPropagation();return false;}
+},true);
 </script>
 </body>
 </html>
