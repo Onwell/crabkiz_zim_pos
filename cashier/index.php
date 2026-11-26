@@ -97,9 +97,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if ($action === 'bootstrap') {
             $ensureTable($pdo);
 
+            // One item no. has one products row per size: match on item no. + size
             $prod = [];
-            foreach ($pdo->query('SELECT id, item_no, name, size, price, stock_qty, initial_qty FROM products')->fetchAll() as $p) {
-                $prod[strtolower((string)$p['item_no'])] = $p;
+            $prodAny = [];
+            foreach ($pdo->query('SELECT id, item_no, name, size, price, stock_qty, initial_qty FROM products ORDER BY id')->fetchAll() as $p) {
+                $prod[strtolower((string)$p['item_no'] . '|' . (string)$p['size'])] = $p;
+                $prodAny[strtolower((string)$p['item_no'])] = $prodAny[strtolower((string)$p['item_no'])] ?? $p;
             }
             $rows = $pdo->query('SELECT sku, name, gender, color, size, qty, price FROM stock_items ORDER BY sku, color, size')->fetchAll();
 
@@ -117,7 +120,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $variants = [];
             foreach ($rows as $r) {
                 $k = strtolower((string)$r['sku']);
-                $p = $prod[$k] ?? null;
+                $p = $prod[$k . '|' . strtolower((string)$r['size'])] ?? ($prodAny[$k] ?? null);
                 if (!$p) {
                     continue;
                 }

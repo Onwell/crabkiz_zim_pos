@@ -50,6 +50,23 @@ function crabkidz_variant_key(string $sku, string $color, string $size): string
     return mb_strtolower(trim($sku)) . '|' . mb_strtolower(trim($color)) . '|' . mb_strtolower(trim($size));
 }
 
+function crabkidz_ensure_products_index(PDO $pdo): void
+{
+    // One item no. must be able to hold many sizes: unique on (item_no, size), not item_no alone.
+    try {
+        $idx = $pdo->query("SHOW INDEX FROM products WHERE Key_name = 'item_no'")->fetchAll();
+        if ($idx) {
+            $pdo->exec('ALTER TABLE products DROP INDEX item_no');
+            $has = $pdo->query("SHOW INDEX FROM products WHERE Key_name = 'item_size'")->fetchAll();
+            if (!$has) {
+                $pdo->exec('ALTER TABLE products ADD UNIQUE KEY item_size (item_no, size)');
+            }
+        }
+    } catch (Throwable $e) {
+        error_log('Crabkidz products index fix failed: ' . $e->getMessage());
+    }
+}
+
 function crabkidz_ensure_notification_tables(PDO $pdo): void
 {
     $pdo->exec('CREATE TABLE IF NOT EXISTS restock_requests (
@@ -94,7 +111,7 @@ function crabkidz_live_data(PDO $pdo, int $adminId = 0): array
                     COALESCE(u.full_name, s.uploaded_by_name) AS uploaded_by
                FROM stock_items s
                LEFT JOIN users u ON u.id = s.uploaded_by
-              ORDER BY s.id'
+              ORDER BY s.updated_at DESC, s.id DESC'
         )->fetchAll();
 
         foreach ($rows as $r) {
@@ -449,6 +466,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         try {
             $pdo = crabkidz_db();
+            crabkidz_ensure_products_index($pdo);
             $pdo->beginTransaction();
 
             $sel = $pdo->prepare('SELECT id, sku, name, color, size FROM stock_items WHERE id = ? LIMIT 1');
@@ -631,6 +649,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $uploaderId = (int)($q->fetchColumn() ?: 0);
         }
         $uploaderIdOrNull = $uploaderId > 0 ? $uploaderId : null;
+
+        crabkidz_ensure_products_index($pdo);
 
         $pdo->beginTransaction();
 
@@ -1008,6 +1028,16 @@ tr.row-unread{background:rgba(242,107,15,.06)}
   .modal .paper{padding:20px}
 }
 @media(prefers-reduced-motion:reduce){.toast{transition:none}.modal .paper{animation:none}}
+
+.hour-chart-note{font-size:13px;color:var(--muted)}
+#hourChart{gap:3px;height:180px}
+#hourChart .bar{max-width:22px}
+#hourAxis{gap:3px}
+#hourAxis div{font-size:10px;flex:1;text-align:center}
+#hourAxis div:nth-child(2n){opacity:.7}
+#smartAlerts .sub{font-size:13px}
+@media(max-width:760px){#hourChart{gap:2px;height:150px}#hourChart .col span{font-size:8px}#hourAxis div{font-size:8px}}
+
 </style>
 </head>
 <body>
@@ -1038,6 +1068,10 @@ tr.row-unread{background:rgba(242,107,15,.06)}
   <div class="grid">
     <div class="card"><h2>Sales by day</h2><p class="sub" id="dayPeak"></p><div class="chart" id="dayChart" role="img" aria-label="Bar chart of sales by day"></div><div class="axis" id="dayAxis"></div></div>
     <div class="card"><h2>Stock alerts</h2><p class="sub">Items at or below 5 pairs</p><div id="alerts"></div><button class="btn" style="width:100%;margin-top:12px" data-go="stocktake">Start stock take</button></div>
+  </div>
+  <div class="grid" style="margin-top:18px">
+    <div class="card"><h2>Sales by hour</h2><p class="sub">Today's sales activity by hour</p><div class="chart" id="hourChart" role="img" aria-label="Bar chart of today's sales by hour"></div><div class="axis" id="hourAxis"></div><p class="sub" id="hourSummary" style="margin-top:14px;margin-bottom:0"></p></div>
+    <div class="card"><h2>Business alerts</h2><p class="sub">Automated alerts requiring attention</p><div id="smartAlerts"></div></div>
   </div>
   <div class="card" style="margin-top:18px">
     <h2>Sales by month — comparison</h2>
@@ -1220,7 +1254,7 @@ function shoeNameForSku(sku){
   var m=stock.find(function(x){return x.sku.trim().toLowerCase()===k});
   return m?m.name:'';
 }
-function addStock(sku,n,s,q,c,p,g,col,by,id){
+function addStock(sku,n,s,q,c,p,g,col,by,id,top){
   var skuClean=String(sku||'').trim();
   var colClean=String(col||'Black').trim()||'Black';
   var sizeClean=String(s||'').trim();
@@ -1233,6 +1267,7 @@ function addStock(sku,n,s,q,c,p,g,col,by,id){
     if(g)f.gender=g;
     if(by)f.by=by;
     if(id)f.id=id;
+    if(top){var ix=stock.indexOf(f);if(ix>0){stock.splice(ix,1);stock.unshift(f);}}
     return f;
   }
   f={
@@ -1247,7 +1282,7 @@ function addStock(sku,n,s,q,c,p,g,col,by,id){
     color:colClean,
     by:by||''
   };
-  stock.push(f);
+  if(top)stock.unshift(f);else stock.push(f);
   return f;
 }
 
@@ -1371,6 +1406,21 @@ function drawDash(){
   $('dayAxis').innerHTML = last7.map(function(d){return '<div>'+d.label+'<br><small style="font-size:10px;opacity:.7">'+d.fullDate+'</small></div>'}).join('');
   $('dayPeak').textContent = 'Busiest day: ' + last7[dayPeakIdx].fullDate + ' (' + last7[dayPeakIdx].label + ') with ' + $m(dayMax);
 
+  // Sales-by-hour chart (uses today's transactions loaded from the sales table).
+  var hourBuckets = Array.from({length:24},function(){return 0;});
+  todaySales.forEach(function(s){
+    var hm=String(s.time||'').match(/^(\d{1,2}):(\d{2})$/);
+    if(hm){var hr=parseInt(hm[1],10);if(hr>=0&&hr<24)hourBuckets[hr]+=Number(s.total||0);}
+  });
+  var hourMax=Math.max.apply(null,hourBuckets)||0;
+  var peakHour=hourBuckets.indexOf(hourMax);
+  $('hourChart').innerHTML=hourBuckets.map(function(v,h){
+    var height=hourMax>0?Math.max(3,Math.round(v/hourMax*145)):3;
+    return '<div class="col'+(v===hourMax&&hourMax>0?' peak':'')+'"><span>'+(v>0?$m(v).replace('.00',''):'')+'</span><div class="bar" style="height:'+height+'px"></div></div>';
+  }).join('');
+  $('hourAxis').innerHTML=hourBuckets.map(function(v,h){return '<div>'+String(h).padStart(2,'0')+'</div>'}).join('');
+  $('hourSummary').textContent=hourMax>0?'Peak sales hour: '+String(peakHour).padStart(2,'0')+':00–'+String((peakHour+1)%24).padStart(2,'0')+':00 ('+$m(hourMax)+')':'No sales recorded today yet.';
+
   var currentMonthName = today.toLocaleDateString(undefined,{month:'long',year:'numeric'});
   var prevMonthDate = new Date(today.getFullYear(), today.getMonth()-1, 1);
   var prevMonthName = prevMonthDate.toLocaleDateString(undefined,{month:'long',year:'numeric'});
@@ -1397,6 +1447,16 @@ function drawDash(){
 
   var low=stock.filter(function(s){return s.qty<=5}).sort(function(a,b){return a.qty-b.qty});
   $('alerts').innerHTML=low.length?'<table style="min-width:0"><tbody>'+low.map(function(s){return '<tr><td>'+esc(s.name)+' ('+esc(s.sku)+')<br><small style="color:var(--muted)">'+esc(s.color)+' · Size '+esc(s.size)+' · '+$m(s.price)+'</small></td><td class="r">'+pillFor(s.qty)+'</td></tr>'}).join('')+'</tbody></table>':'<p class="sub">Everything is stocked.</p>';
+
+  // Smart alerts: out-of-stock, low-stock and pending cashier restock requests.
+  var outOfStock=stock.filter(function(s){return s.qty===0;});
+  var lowOnly=stock.filter(function(s){return s.qty>0&&s.qty<=5;});
+  var pending=notifications.filter(function(n){return String(n.status||'').toLowerCase()==='pending';});
+  var alertRows=[];
+  if(outOfStock.length)alertRows.push('<div style="display:flex;gap:10px;align-items:flex-start;padding:12px 0;border-bottom:1px solid var(--line)"><span class="pill out">Out of stock</span><div><b>'+outOfStock.length+' item variant'+(outOfStock.length===1?'':'s')+'</b><div class="sub" style="margin:2px 0 0">'+outOfStock.slice(0,3).map(function(x){return esc(x.name)+' · '+esc(x.size)}).join(', ')+(outOfStock.length>3?' and more':'')+'</div></div></div>');
+  if(lowOnly.length)alertRows.push('<div style="display:flex;gap:10px;align-items:flex-start;padding:12px 0;border-bottom:1px solid var(--line)"><span class="pill low">Low stock</span><div><b>'+lowOnly.length+' variant'+(lowOnly.length===1?'':'s')+' need attention</b><div class="sub" style="margin:2px 0 0">Stock is at 1–5 pairs.</div></div></div>');
+  if(pending.length)alertRows.push('<div style="display:flex;gap:10px;align-items:flex-start;padding:12px 0;border-bottom:1px solid var(--line)"><span class="pill low">Restock request</span><div><b>'+pending.length+' pending request'+(pending.length===1?'':'s')+'</b><div class="sub" style="margin:2px 0 0">Cashiers have requested stock replenishment.</div><a href="#notifications" style="color:var(--strong);font-weight:600">Review requests</a></div></div>');
+  $('smartAlerts').innerHTML=alertRows.length?alertRows.join(''):'<div style="padding:12px 0"><span class="pill">All clear</span><p class="sub" style="margin:8px 0 0">No stock or restock-request alerts at the moment.</p></div>';
 }
 
 /* ---------- Sales ---------- */
@@ -1664,7 +1724,7 @@ $('addBtn').addEventListener('click',function(){
     btn.disabled=false;
     if(res && res.ok && res.saved && res.saved.length){
       var r=res.saved[0];
-      addStock(r.sku,r.name,r.size,r.qty||q,r.cost,r.price,r.gender,r.color,r.by,r.id);
+      addStock(r.sku,r.name,r.size,r.qty||q,r.cost,r.price,r.gender,r.color,r.by,r.id,true);
       ['n-size','n-cost','n-price'].forEach(function(i){$(i).value=''});
       $('n-qty').value='1';
       $('n-size').focus();
@@ -1706,7 +1766,8 @@ $('csv').addEventListener('change',function(e){
     }
     saveStock(items).then(function(res){
       if(res && res.ok && res.saved){
-        res.saved.forEach(function(x){addStock(x.sku,x.name,x.size,x.qty||1,x.cost,x.price,x.gender,x.color,x.by,x.id)});
+        res.saved.slice().reverse().forEach(function(x){addStock(x.sku,x.name,x.size,x.qty||1,x.cost,x.price,x.gender,x.color,x.by,x.id,true)});
+        invPage=0;
         drawInventory();
         var skipped=bad+(res.skipped||0);
         toast('✓ '+res.saved.length+' rows saved'+(skipped?', '+skipped+' skipped':'')+' — uploaded by '+(res.uploadedBy||'you'));
